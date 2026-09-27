@@ -1,0 +1,37 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Sign in with your NB Power MyAccount credentials (www.nbpower.com). The integration logs in for itself and renews sessions automatically.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "description": "Sign in again with your NB Power MyAccount credentials.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to NB Power. Check your network and try again.",
+      "invalid_auth": "Invalid credentials, or NB Power blocked the login (sign in to the website once in a browser, then try again)."
+    },
+    "abort": {
+      "already_configured": "This NB Power account is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "scan_interval": "Update interval (hours)",
+          "backfill_hourly": "Backfill last year at hourly resolution (background, resumable)"
+        }
+      }
+    }
+  }
+}

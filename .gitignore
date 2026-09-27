@@ -1,0 +1,22 @@
+# Reference repositories cloned during research
+_reference/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Real API captures may contain personal data
+tests/fixtures/real/
+scripts/out/
+.ha_token
+
+# Local HA database snapshots
+*.db
+*.db-wal
+*.db-shm
+
+# HA test-run artifacts
+storage/
