@@ -49,7 +49,7 @@ SENSORS: tuple[NBPowerSensorEntityDescription, ...] = (
         translation_key="cost_usage",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement=CURRENCY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=2,
         value_fn=lambda data: data.get("cumulative_cost"),
     ),

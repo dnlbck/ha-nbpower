@@ -20,7 +20,6 @@ from .api import NBPowerClient, UsageRow
 from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
-    MI_RECENT_DAYS,
     MIN_SCAN_INTERVAL,
     REPAIR_GEN,
     STORAGE_KEY,
@@ -71,6 +70,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.client = client
         self._username = username
         self._password = password
+        self._stats_extension_running = False
         self._store = Store[dict[str, Any]](
             hass, STORAGE_VERSION, f"{STORAGE_KEY}.{entry.entry_id}"
         )
@@ -170,12 +170,12 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not self.client.bootstrapped:
                 await self.client.bootstrap(self._username, self._password)
             try:
-                return await self._async_fetch_all()
+                data = await self._async_fetch_all()
             except NBPowerAuthError:
                 _LOGGER.debug("Widget token expired; logging in again")
                 self.client.invalidate()
                 await self.client.bootstrap(self._username, self._password)
-                return await self._async_fetch_all()
+                data = await self._async_fetch_all()
         except NBPowerAuthError as err:
             raise ConfigEntryAuthFailed(
                 f"Could not sign in to NB Power: {err}"
@@ -184,6 +184,36 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(f"NB Power API error: {err}") from err
         except (TimeoutError, aiohttp.ClientError) as err:
             raise UpdateFailed(f"Error communicating with NB Power: {err}") from err
+
+        self._async_schedule_stat_extension()
+        return data
+
+    def _async_schedule_stat_extension(self) -> None:
+        """Import hourly statistics for newly published days after a refresh.
+
+        The 15-minute feed publishes a day's data only after that day ends,
+        so each refresh checks for newly available days (usually yesterday)
+        and imports their real hourly usage.
+        """
+        if self._stats_extension_running:
+            return
+        entry = self.config_entry
+        if entry is None:
+            return
+
+        async def _run() -> None:
+            self._stats_extension_running = True
+            try:
+                from .statistics import async_backfill_hourly_statistics
+
+                await async_backfill_hourly_statistics(self.hass, entry, self)
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning("Hourly statistics extension failed", exc_info=True)
+            finally:
+                self._stats_extension_running = False
+
+        self._stats_extension_running = True
+        self.hass.async_create_task(_run())
 
     async def _async_fetch_all(self) -> dict[str, Any]:
         now = dt_util.now()
@@ -203,26 +233,20 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         # The daily books lag several days and can even drop days that are
-        # later re-booked at cycle close; the 15-minute feed publishes much
-        # sooner (roughly intraday). Fold its newest days — strictly after
-        # the books' last day, so nothing is double counted — into the
-        # cumulative so "today" advances between book updates.
+        # later re-booked at cycle close. The 15-minute feed publishes a
+        # day's data only after that day ends, so only TODAY can be folded
+        # into the cumulative here — older unpublished days are imported
+        # with their real hours by the statistics extension instead.
         recent_days: dict[date, float] = {}
+        today_kwh = 0.0
         try:
-            for offset in range(0, MI_RECENT_DAYS):
-                day = today - timedelta(days=offset)
-                if daily_end is not None and day <= daily_end:
-                    break  # older days are the books' job
-                if last_cycle_end is not None and day <= last_cycle_end:
-                    continue
-                rows = await self.client.get_interval_usage(day)
-                if rows:
-                    recent_days[day] = round(
-                        sum(row.kwh or 0.0 for row in rows), 3
-                    )
+            rows = await self.client.get_interval_usage(today)
+            if rows:
+                today_kwh = round(sum(row.kwh or 0.0 for row in rows), 3)
+                recent_days[today] = today_kwh
         except NBPowerApiError:
-            _LOGGER.warning("Could not fetch recent 15-minute data", exc_info=True)
-        recent_kwh = round(sum(recent_days.values()), 3)
+            _LOGGER.debug("No 15-minute data published for today yet")
+        recent_kwh = today_kwh
 
         def _post_cycle(value) -> float:
             return sum(

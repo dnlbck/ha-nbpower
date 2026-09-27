@@ -45,14 +45,7 @@ def _expected_cumulative() -> float:
     daily_end = max(_parse_day(r["UsageDate"]) for r in daily)
     post = [r for r in daily if _parse_day(r["UsageDate"]) > last_cycle_end]
     books = sum(r["Consumption"] for r in monthly) + sum(r["Consumption"] for r in post)
-    today = date.today()
-    recent = 0.0
-    day = today
-    while day > daily_end:
-        rows = _interval_rows(day)
-        recent += sum(r["Consumption"] for r in (rows[:12] if day == today else rows))
-        day -= timedelta(days=1)
-    return books + round(recent, 3)
+    return books
 
 
 def _expected_history_points() -> list[tuple[date, float]]:
@@ -126,7 +119,7 @@ async def test_setup_creates_sensors(
 
     cost = hass.states.get(_entity_id(hass, entry, "cost_usage"))
     assert cost.attributes["device_class"] == "monetary"
-    assert cost.attributes["state_class"] == "total_increasing"
+    assert cost.attributes["state_class"] == "total"
     assert float(cost.state) > 0
 
     # The month-to-date numbers come from the monthly payload, not the
@@ -170,8 +163,9 @@ async def test_energy_sensor_derives_from_cycles_plus_daily(
     entry = await _setup_entry(hass, portal, nbpower_urls)
     energy = hass.states.get(_entity_id(hass, entry, ENERGY_KEY))
     assert float(energy.state) == pytest.approx(_expected_cumulative(), abs=1.0)
-    # Today's partial 15-minute data is exposed as an attribute.
-    assert energy.attributes["today_kwh"] > 0
+    # Today's 15-minute data is not published yet (the server returns the
+    # latest published day, which the client filters out).
+    assert energy.attributes["today_kwh"] == 0.0
 
 
 async def test_history_statistics_imported(
@@ -470,3 +464,54 @@ async def test_repair_generation_reimports_consistently(
     ]
     assert hourly_rows
     assert min(r["state"] for r in hourly_rows) > 1000
+
+
+async def test_extension_imports_newly_published_days(
+    recorder_mock,
+    hass,
+    portal,
+    nbpower_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """After a refresh, newly published days are imported with real hours.
+
+    Simulates the live failure: the backfill stopped at Sep 25 because
+    Sep 26 was unpublished; the next refresh must pick it up.
+    """
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.statistics import statistics_during_period
+
+    entry = await _setup_entry(hass, portal, nbpower_urls, backfill_hourly=False)
+    coordinator = entry.runtime_data
+    yesterday = date.today() - timedelta(days=1)
+
+    # Simulate the backfill having stopped one day early.
+    await coordinator.store_interval_through(yesterday - timedelta(days=1))
+    await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await get_instance(hass).async_block_till_done()
+
+    statistic_id = _entity_id(hass, entry, ENERGY_KEY)
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utc_from_timestamp(0),
+        dt_util.now(),
+        (statistic_id,),
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+    rows = sorted(stats[statistic_id], key=lambda r: r["start"])
+    sums = [r["sum"] for r in rows]
+    changes = [b - a for a, b in zip([0.0] + sums[:-1], sums)]
+    assert min(changes) >= 0
+    # Yesterday now has 24 hourly rows with real usage.
+    atl_rows = [
+        r
+        for r in rows
+        if dt_util.as_local(dt_util.utc_from_timestamp(r["start"])).date() == yesterday
+    ]
+    assert len(atl_rows) == 24
+    assert coordinator.stored_interval_through() >= yesterday

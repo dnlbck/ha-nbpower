@@ -195,3 +195,11 @@ async def test_usage_requires_bootstrap(portal):
         )
         with pytest.raises(NBPowerAuthError):
             await client.get_usage(mode="D", rtype="K")
+
+
+async def test_interval_usage_filters_fallback_rows(client):
+    """The server returns the latest published day for unpublished days."""
+    from datetime import date
+
+    rows = await client.get_interval_usage(date.today())
+    assert rows == []  # today's rows are actually yesterday's; filtered out

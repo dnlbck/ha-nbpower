@@ -413,10 +413,14 @@ class NBPowerClient:
 
         Note the mode is uppercase ``MI``; ``Mi`` returns nothing. Available
         roughly one year back, one day per request; the server rejects
-        multi-day ranges.
+        multi-day ranges. Observed live: requesting a day that has not
+        published yet returns the *latest published* day's rows instead of
+        an empty set, so rows are filtered to the requested day here.
         """
         payload = await self.get_usage(mode="MI", rtype="K", day=day)
-        return parse_usage_rows(payload)
+        return [
+            row for row in parse_usage_rows(payload) if row.start.date() == day
+        ]
 
     # ------------------------------------------------------------------
     # Portal session (ASP.NET WebForms)

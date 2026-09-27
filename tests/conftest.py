@@ -228,11 +228,14 @@ def _usage_payload(mode: str, rtype: str, strdate: str | None, enddate, date_fro
         today = date.today()
         if day is None or not (today - timedelta(days=365) <= day <= today):
             data["objUsageGenerationResultSetTwo"] = []
-        else:
-            rows = _interval_rows(day)
-            data["objUsageGenerationResultSetTwo"] = (
-                rows[:12] if day == today else rows
+        elif day == today:
+            # Live behavior: unpublished days return the latest published
+            # day's rows; the client must filter by requested date.
+            data["objUsageGenerationResultSetTwo"] = _interval_rows(
+                today - timedelta(days=1)
             )
+        else:
+            data["objUsageGenerationResultSetTwo"] = _interval_rows(day)
     else:
         data["objUsageGenerationResultSetTwo"] = []  # S: not used
     return {"result": {"Data": data, "Status": 1}}

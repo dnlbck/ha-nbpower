@@ -29,6 +29,7 @@ from homeassistant.components.recorder.models import (
     StatisticMeanType,
     StatisticMetaData,
 )
+from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import async_import_statistics
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
@@ -160,14 +161,16 @@ async def async_import_history_statistics(
 async def async_backfill_hourly_statistics(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: NBPowerCoordinator
 ) -> None:
-    """Phase 2: upgrade the last year to hourly resolution in the background.
+    """Import hourly statistics for published days, resumable and repeatable.
 
-    Fetches one day of 15-minute data per request, paced to stay polite,
-    and persists progress so restarts resume where this left off. The rows'
-    ``state`` values continue the phase-1 day-resolution running total (the
-    seed is derived once and persisted), keeping the whole statistic series
-    monotonic — a series that resets to zero every midnight renders as
-    negative flow in the Energy dashboard.
+    Runs once at setup for the historical backfill and again after every
+    coordinator refresh: the 15-minute feed publishes a day's data only
+    after that day ends, so each refresh picks up the newly published days
+    (usually yesterday). Rows chain cumulative sums from the persisted
+    seed; afterwards the sensor's monotonic floor is raised to the chain
+    end and any native recorder rows after the chain are flattened onto it
+    — without that, the energy of each newly imported day would also be
+    recorded as one lump at the refresh hour (double count).
     """
     statistic_id = _energy_statistic_id(hass, entry)
     if statistic_id is None:
@@ -192,12 +195,14 @@ async def async_backfill_hourly_statistics(
 
     imported = 0
     day = resume_from
+    last_imported_start: datetime | None = None
     while day < today:
         try:
             rows = await client.get_interval_usage(day)
         except (NBPowerError, TimeoutError, OSError) as err:
             _LOGGER.warning(
-                "Hourly backfill stopped at %s (%s); it will resume on restart",
+                "Hourly statistics import stopped at %s (%s); it will retry "
+                "on the next refresh",
                 day,
                 err,
             )
@@ -207,13 +212,15 @@ async def async_backfill_hourly_statistics(
             points = hourly_points(rows)
             statistics: list[StatisticData] = []
             for when, kwh in points:
+                start = dt_util.as_local(when)
                 statistics.append(
                     StatisticData(
-                        start=dt_util.as_local(when),
+                        start=start,
                         state=round(seed, 3),
                         sum=round(seed + kwh, 3),
                     )
                 )
+                last_imported_start = start
                 seed += kwh
             async_import_statistics(hass, _metadata(statistic_id), statistics)
             await coordinator.store_interval_state_seed(round(seed, 3))
@@ -235,14 +242,48 @@ async def async_backfill_hourly_statistics(
         day += timedelta(days=1)
         await asyncio.sleep(INTERVAL_REQUEST_PAUSE)
 
-    _LOGGER.info(
-        "Hourly backfill complete: imported %s hourly rows for %s",
-        imported,
-        statistic_id,
+    if imported:
+        _LOGGER.info(
+            "Hourly statistics import: %s new rows for %s (chain now %.1f)",
+            imported,
+            statistic_id,
+            seed,
+        )
+        # The interval-fed chain can total more than the books-fed sensor
+        # (the 15-minute feed runs ahead of the daily books). Raise the
+        # sensor's floor to the chain end so the sensor continues the
+        # imported series; the resulting sensor jump would otherwise be
+        # recorded by the recorder as a lump at the refresh hour, double
+        # counting the day that was just imported. Flatten the native rows
+        # after the chain onto the new chain end to absorb it.
+        await coordinator.raise_floor_to(seed)
+        await _async_flatten_tail(hass, statistic_id, last_imported_start, round(seed, 3))
+
+
+async def _async_flatten_tail(
+    hass: HomeAssistant,
+    statistic_id: str,
+    after: datetime | None,
+    chain_end: float,
+) -> None:
+    """Rewrite native rows after the imported chain to sit at ``chain_end``.
+
+    The sensor's floor raise (and today's interval fold-in) create native
+    state changes whose energy is already attributed to real hours by the
+    imported chain; rewriting the tail rows to a flat ``chain_end`` removes
+    the duplicate lumps while keeping the series continuous.
+    """
+    if after is None:
+        return
+    from homeassistant.components.recorder.statistics import get_last_statistics
+
+    rows = await get_instance(hass).async_add_executor_job(
+        get_last_statistics, hass, 72, statistic_id, True, {"sum"}
     )
-    # The interval-fed chain can total more than the books-fed sensor (the
-    # 15-minute feed runs ahead of the daily books). Raise the sensor's
-    # floor to the chain end so native recorder sums continue the imported
-    # series exactly — a lower sensor value would render the first change
-    # across the history/live seam as a negative bar.
-    await coordinator.raise_floor_to(seed)
+    tail = [r for r in (rows or []) if r["start"] > after]
+    if not tail:
+        return
+    updates = [
+        StatisticData(start=r["start"], state=chain_end, sum=chain_end) for r in tail
+    ]
+    async_import_statistics(hass, _metadata(statistic_id), updates)
