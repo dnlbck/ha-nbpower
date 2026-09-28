@@ -611,3 +611,61 @@ async def test_cost_history_imported(
     # The cost chain ends at the sensor's own value (same books inputs).
     sensor_cost = float(hass.states.get(cost_id).state)
     assert sums[-1] == pytest.approx(sensor_cost, abs=1.0)
+
+
+async def test_stats_frontier_pins_and_limits_imports(
+    recorder_mock,
+    hass,
+    portal,
+    nbpower_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """The import never writes hours the recorder owns.
+
+    After setup the frontier is pinned; a later refresh with newly
+    published days beyond the frontier does not import them.
+    """
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.statistics import statistics_during_period
+    from datetime import datetime
+
+    from conftest import _interval_rows
+
+    entry = await _setup_entry(hass, portal, nbpower_urls)
+    coordinator = entry.runtime_data
+    await get_instance(hass).async_block_till_done()
+
+    frontier = coordinator.stored_stats_frontier()
+    assert frontier is not None and frontier <= datetime.now(frontier.tzinfo)
+
+    statistic_id = _entity_id(hass, entry, ENERGY_KEY)
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, dt_util.utc_from_timestamp(0), dt_util.now(),
+        (statistic_id,), "hour", None, {"state", "sum"},
+    )
+    rows_before = sorted(stats[statistic_id], key=lambda r: r["start"])
+
+    # Simulate the portal publishing more pre-frontier data: rewind the
+    # partial-day marker so the extension re-fetches the frontier day.
+    yesterday = date.today() - timedelta(days=1)
+    await coordinator.store_interval_through(yesterday - timedelta(days=1))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await get_instance(hass).async_block_till_done()
+
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, dt_util.utc_from_timestamp(0), dt_util.now(),
+        (statistic_id,), "hour", None, {"state", "sum"},
+    )
+    rows_after = sorted(stats[statistic_id], key=lambda r: r["start"])
+    sums = [r["sum"] for r in rows_after]
+    prev = [0.0] + sums[:-1]
+    changes = [b - a for a, b in zip(prev, sums)]
+    assert min(changes) >= 0
+    # No rows were added at or after the frontier.
+    frontier_ts = frontier.timestamp()
+    before_f = [r for r in rows_before if r["start"] < frontier_ts]
+    after_f = [r for r in rows_after if r["start"] >= frontier_ts]
+    assert before_f, "pre-frontier history present"
+    assert len(after_f) <= len([r for r in rows_before if r["start"] >= frontier_ts])

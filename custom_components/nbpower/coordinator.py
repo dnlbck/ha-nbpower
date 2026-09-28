@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import aiohttp
@@ -80,6 +80,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.stats_imported = False
         self._interval_through: date | None = None
         self._interval_state_seed: float | None = None
+        self._stats_frontier: datetime | None = None
         self._last_cumulative_kwh: float | None = None
         self._last_cumulative_cost: float | None = None
 
@@ -106,6 +107,11 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         through = raw.get("interval_through")
         self._interval_through = date.fromisoformat(through) if through else None
         self._interval_state_seed = raw.get("interval_state_seed")
+        self._stats_frontier = (
+            datetime.fromisoformat(raw["stats_frontier"])
+            if raw.get("stats_frontier")
+            else None
+        )
         self._last_cumulative_kwh = raw.get("last_cumulative_kwh")
         self._last_cumulative_cost = raw.get("last_cumulative_cost")
 
@@ -127,6 +133,19 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Running total the hourly backfill's state series continues from."""
         return self._interval_state_seed
 
+    def stored_stats_frontier(self):
+        """The datetime after which the recorder owns all statistics.
+
+        The import must never write rows at or after this point: those
+        hours belong to the recorder (its short-term data wins rewrites),
+        and crossing the boundary is what creates negative seams.
+        """
+        return self._stats_frontier
+
+    async def store_stats_frontier(self, frontier: datetime) -> None:
+        self._stats_frontier = frontier
+        await self._async_save_stored()
+
     async def store_interval_state_seed(self, seed: float) -> None:
         """Persist the hourly-backfill state seed (continues phase-1 series)."""
         self._interval_state_seed = seed
@@ -143,6 +162,11 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     else None
                 ),
                 "interval_state_seed": self._interval_state_seed,
+                "stats_frontier": (
+                    self._stats_frontier.isoformat()
+                    if self._stats_frontier
+                    else None
+                ),
                 "last_cumulative_kwh": self._last_cumulative_kwh,
                 "last_cumulative_cost": self._last_cumulative_cost,
             }

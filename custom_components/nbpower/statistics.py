@@ -233,6 +233,11 @@ async def _async_import_hourly(
     start_day = today - timedelta(days=INTERVAL_BACKFILL_DAYS)
     through = coordinator.stored_interval_through()
     resume_from = max(start_day, through + timedelta(days=1)) if through else start_day
+    # The recorder owns everything from the frontier onward; the import
+    # never writes those hours (rewrites there get reverted and create
+    # negative seams). On first completion the frontier is pinned to now.
+    frontier = coordinator.stored_stats_frontier()
+    day_limit = min(frontier.date(), today) if frontier else today
 
     # Seed the hourly state series where the day-resolution series left
     # off: everything phase 1 recorded strictly before the first hour row.
@@ -249,7 +254,7 @@ async def _async_import_hourly(
     imported = 0
     day = resume_from
     last_imported_start: datetime | None = None
-    while day < today:
+    while day < day_limit:
         try:
             rows = await client.get_interval_usage(day)
         except (NBPowerError, TimeoutError, OSError) as err:
@@ -307,9 +312,11 @@ async def _async_import_hourly(
             statistic_id,
             seed,
         )
-    # Align the recorder-owned block after the chain onto the chain end.
-    # The sensor intentionally trails the chain (it follows the slower
-    # daily books); without this alignment the seam renders negative.
+    if frontier is None and coordinator.stored_interval_through() is not None:
+        await coordinator.store_stats_frontier(dt_util.now())
+        _LOGGER.info("Statistics frontier pinned; recorder owns hours from here")
+    # Align the recorder-owned block after the chain onto the chain end
+    # (a no-op once aligned; re-anchors the native block if it drifts).
     if coordinator.stored_interval_through() is not None:
         await _async_align_native_block(
             hass, statistic_id, last_imported_start, round(seed, 3)
