@@ -515,3 +515,69 @@ async def test_extension_imports_newly_published_days(
     ]
     assert len(atl_rows) == 24
     assert coordinator.stored_interval_through() >= yesterday
+
+
+async def test_partial_day_not_marked_complete(
+    recorder_mock,
+    hass,
+    portal,
+    nbpower_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """Days publish partially; a partial day re-fetches without doubling."""
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.statistics import statistics_during_period
+
+    from conftest import _interval_rows
+
+    portal.app["state"]["partial_day"] = True
+    entry = await _setup_entry(hass, portal, nbpower_urls)
+    coordinator = entry.runtime_data
+    today = date.today()
+    partial_day = today - timedelta(days=2)
+    assert coordinator.stored_interval_through() == partial_day - timedelta(days=1)
+    await get_instance(hass).async_block_till_done()
+
+    statistic_id = _entity_id(hass, entry, ENERGY_KEY)
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, dt_util.utc_from_timestamp(0), dt_util.now(),
+        (statistic_id,), "hour", None, {"state", "sum"},
+    )
+    rows = sorted(stats[statistic_id], key=lambda r: r["start"])
+    sums = [r["sum"] for r in rows]
+    changes = [b - a for a, b in zip([0.0] + sums[:-1], sums)]
+    assert min(changes) >= 0  # tail flattened despite the partial day
+
+    partial_rows = [
+        r for r in rows
+        if dt_util.as_local(dt_util.utc_from_timestamp(r["start"])).date() == partial_day
+    ]
+    assert len(partial_rows) == 16
+
+    # Portal finishes publishing the day; next refresh completes it.
+    portal.app["state"]["partial_day"] = False
+    await coordinator.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await get_instance(hass).async_block_till_done()
+
+    assert coordinator.stored_interval_through() >= partial_day
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, dt_util.utc_from_timestamp(0), dt_util.now(),
+        (statistic_id,), "hour", None, {"state", "sum"},
+    )
+    rows = sorted(stats[statistic_id], key=lambda r: r["start"])
+    sums = [r["sum"] for r in rows]
+    changes = [b - a for a, b in zip([0.0] + sums[:-1], sums)]
+    assert min(changes) >= 0
+    full_rows = [
+        r for r in rows
+        if dt_util.as_local(dt_util.utc_from_timestamp(r["start"])).date() == partial_day
+    ]
+    assert len(full_rows) == 24
+    day_change = sum(
+        c for r, c in zip(rows, changes)
+        if dt_util.as_local(dt_util.utc_from_timestamp(r["start"])).date() == partial_day
+    )
+    expected = sum(r["Consumption"] for r in _interval_rows(partial_day))
+    assert day_change == pytest.approx(expected, abs=0.05)  # counted exactly once

@@ -123,17 +123,6 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Return the last day the hourly backfill completed, if any."""
         return self._interval_through
 
-    async def raise_floor_to(self, value: float) -> None:
-        """Raise the monotonic counter floor so the sensor reaches ``value``.
-
-        Used after the hourly backfill: the interval-fed statistics chain
-        can total more than the books-derived sensor, and the sensor must
-        match its own history or the history/live seam renders negative.
-        """
-        if self._last_cumulative_kwh is None or value > self._last_cumulative_kwh:
-            self._last_cumulative_kwh = round(value, 3)
-            await self._async_save_stored()
-
     def stored_interval_state_seed(self) -> float | None:
         """Running total the hourly backfill's state series continues from."""
         return self._interval_state_seed

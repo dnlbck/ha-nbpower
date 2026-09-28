@@ -235,7 +235,11 @@ def _usage_payload(mode: str, rtype: str, strdate: str | None, enddate, date_fro
                 today - timedelta(days=1)
             )
         else:
-            data["objUsageGenerationResultSetTwo"] = _interval_rows(day)
+            rows = _interval_rows(day)
+            if state.get("partial_day") and day == today - timedelta(days=2):
+                # Live behavior: days publish partially (16 of 96 intervals)
+                rows = rows[:64]
+            data["objUsageGenerationResultSetTwo"] = rows
     else:
         data["objUsageGenerationResultSetTwo"] = []  # S: not used
     return {"result": {"Data": data, "Status": 1}}

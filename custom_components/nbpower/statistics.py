@@ -211,20 +211,37 @@ async def async_backfill_hourly_statistics(
         if rows:
             points = hourly_points(rows)
             statistics: list[StatisticData] = []
+            day_seed = seed
             for when, kwh in points:
                 start = dt_util.as_local(when)
                 statistics.append(
                     StatisticData(
                         start=start,
-                        state=round(seed, 3),
-                        sum=round(seed + kwh, 3),
+                        state=round(day_seed, 3),
+                        sum=round(day_seed + kwh, 3),
                     )
                 )
                 last_imported_start = start
-                seed += kwh
+                day_seed += kwh
             async_import_statistics(hass, _metadata(statistic_id), statistics)
-            await coordinator.store_interval_state_seed(round(seed, 3))
             imported += len(points)
+            if len(points) >= 24:
+                # Complete day: advance the persisted chain; the next run
+                # continues from here.
+                seed = day_seed
+                await coordinator.store_interval_state_seed(round(seed, 3))
+            else:
+                # The portal publishes days partially. This is the feed's
+                # frontier: keep the persisted chain at the last complete
+                # day (so this day re-fetches from the same base,
+                # idempotently) and stop — later days cannot be trusted
+                # to be complete either.
+                _LOGGER.info(
+                    "Day %s partially published (%s of 24 hours); will re-fetch",
+                    day,
+                    len(points),
+                )
+                break
         else:
             # Days this close to now have not validated yet; stop here and
             # let a later run pick them up once the portal publishes them.
@@ -249,41 +266,71 @@ async def async_backfill_hourly_statistics(
             statistic_id,
             seed,
         )
-        # The interval-fed chain can total more than the books-fed sensor
-        # (the 15-minute feed runs ahead of the daily books). Raise the
-        # sensor's floor to the chain end so the sensor continues the
-        # imported series; the resulting sensor jump would otherwise be
-        # recorded by the recorder as a lump at the refresh hour, double
-        # counting the day that was just imported. Flatten the native rows
-        # after the chain onto the new chain end to absorb it.
-        await coordinator.raise_floor_to(seed)
-        await _async_flatten_tail(hass, statistic_id, last_imported_start, round(seed, 3))
+    # Align the recorder-owned block after the chain onto the chain end.
+    # The sensor intentionally trails the chain (it follows the slower
+    # daily books); without this alignment the seam renders negative.
+    if coordinator.stored_interval_through() is not None:
+        await _async_align_native_block(
+            hass, statistic_id, last_imported_start, round(seed, 3)
+        )
 
 
-async def _async_flatten_tail(
+def _row_ts(value: datetime | float) -> float:
+    """Normalize a statistics row start (datetime or epoch) to epoch."""
+    if isinstance(value, datetime):
+        return value.timestamp()
+    return float(value)
+
+
+def _row_dt(value: datetime | float) -> datetime:
+    """Normalize a statistics row start to an aware datetime."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else dt_util.utc_from_timestamp(value.timestamp())
+    return dt_util.utc_from_timestamp(value)
+
+
+async def _async_align_native_block(
     hass: HomeAssistant,
     statistic_id: str,
     after: datetime | None,
     chain_end: float,
 ) -> None:
-    """Rewrite native rows after the imported chain to sit at ``chain_end``.
+    """Shift native recorder rows after the imported chain onto ``chain_end``.
 
-    The sensor's floor raise (and today's interval fold-in) create native
-    state changes whose energy is already attributed to real hours by the
-    imported chain; rewriting the tail rows to a flat ``chain_end`` removes
-    the duplicate lumps while keeping the series continuous.
+    The recorder owns recent hours (its short-term data wins over row
+    rewrites), so alignment goes through the recorder's own
+    ``adjust_statistics`` — it updates long- AND short-term rows, keeping
+    future recompiles consistent. Without this, the first native row after
+    the imported chain sits at the books-fed sensor level, below the
+    interval-fed chain, rendering as a negative bar at the seam.
     """
     if after is None:
         return
-    from homeassistant.components.recorder.statistics import get_last_statistics
+    from homeassistant.components.recorder.statistics import (
+        adjust_statistics,
+        get_last_statistics,
+    )
 
-    rows = await get_instance(hass).async_add_executor_job(
+    result = await get_instance(hass).async_add_executor_job(
         get_last_statistics, hass, 72, statistic_id, True, {"sum"}
     )
-    tail = [r for r in (rows or []) if r["start"] > after]
+    tail = sorted(
+        (r for r in (result.get(statistic_id) or []) if _row_ts(r["start"]) > after.timestamp()),
+        key=lambda r: _row_ts(r["start"]),
+    )
     if not tail:
         return
-    updates = [
-        StatisticData(start=r["start"], state=chain_end, sum=chain_end) for r in tail
-    ]
-    async_import_statistics(hass, _metadata(statistic_id), updates)
+    first_sum = tail[0].get("sum") or 0.0
+    gap = round(chain_end - first_sum, 3)
+    if abs(gap) < 0.01:
+        return
+    instance = get_instance(hass)
+    await instance.async_add_executor_job(
+        adjust_statistics, instance, statistic_id, _row_dt(tail[0]["start"]), gap, "kWh"
+    )
+    _LOGGER.info(
+        "Aligned native statistics block for %s by %+.3f kWh at %s",
+        statistic_id,
+        gap,
+        tail[0]["start"],
+    )
