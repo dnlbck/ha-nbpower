@@ -37,4 +37,4 @@ STORAGE_VERSION = 1
 
 # Bump to force one clean re-import of all statistics (day rows + hourly
 # upgrade) after changes to the state-chaining convention.
-REPAIR_GEN = 5
+REPAIR_GEN = 7

@@ -41,20 +41,28 @@ from .api import UsageRow
 from .const import DOMAIN, INTERVAL_BACKFILL_DAYS, INTERVAL_REQUEST_PAUSE
 from .coordinator import NBPowerCoordinator
 from .exceptions import NBPowerError
-from .sensor import ENERGY_KEY, UNIQUE_ID_TEMPLATE
+from .sensor import COST_KEY, ENERGY_KEY, UNIQUE_ID_TEMPLATE
 
 _LOGGER = logging.getLogger(__name__)
 
+# Only one statistics import may run at a time: the setup backfill and the
+# per-refresh extension both drive the same chain, and interleaved runs
+# corrupt the cumulative sums (observed live as a mixed-baseline series).
+_import_lock = asyncio.Lock()
 
-def daily_points(rows: list[UsageRow], today: date) -> list[tuple[date, float]]:
-    """Expand history rows into (day, kWh) points, skipping today.
+
+def daily_points(
+    rows: list[UsageRow], today: date, value=lambda r: r.kwh
+) -> list[tuple[date, float]]:
+    """Expand history rows into (day, value) points, skipping today.
 
     Monthly cycle rows are spread evenly across their FromDate..ToDate span;
     daily rows pass through as single points.
     """
     points: list[tuple[date, float]] = []
     for row in rows:
-        if row.kwh is None:
+        row_value = value(row)
+        if row_value is None:
             continue
         start = row.start.date()
         if row.end is not None:
@@ -62,10 +70,10 @@ def daily_points(rows: list[UsageRow], today: date) -> list[tuple[date, float]]:
             days = (end - start).days + 1
             if days <= 0:
                 continue
-            per_day = round(row.kwh / days, 4)
+            per_day = round(row_value / days, 4)
             points.extend((start + timedelta(days=i), per_day) for i in range(days))
         else:
-            points.append((start, row.kwh))
+            points.append((start, row_value))
     return [p for p in points if p[0] < today]
 
 
@@ -89,6 +97,19 @@ def _metadata(statistic_id: str) -> StatisticMetaData:
         statistic_id=statistic_id,
         unit_class="energy",
         unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+    )
+
+
+def _cost_metadata(statistic_id: str) -> StatisticMetaData:
+    """Mirror the recorder's own metadata for the monetary total sensor."""
+    return StatisticMetaData(
+        mean_type=StatisticMeanType.NONE,
+        has_sum=True,
+        name=None,
+        source="recorder",
+        statistic_id=statistic_id,
+        unit_class=None,
+        unit_of_measurement="CAD",
     )
 
 
@@ -149,29 +170,61 @@ async def async_import_history_statistics(
         await coordinator.mark_stats_imported()
         return
 
-    points = daily_points(history, dt_util.now().date())
+    today = dt_util.now().date()
+    points = daily_points(history, today)
     if points:
         async_import_statistics(hass, _metadata(statistic_id), _rows_to_statistics(points))
         _LOGGER.info(
             "Imported %s day-resolution statistics for %s", len(points), statistic_id
         )
+
+    # Cost history: cycles and daily rows carry dollar amounts; the cost
+    # entity's books are exactly these inputs, so the imported chain ends
+    # at the sensor's own value — no seam alignment needed.
+    cost_id = er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, UNIQUE_ID_TEMPLATE.format(entry_id=entry.entry_id, key=COST_KEY)
+    )
+    if cost_id:
+        cost_points = [
+            p
+            for p in daily_points(history, today, value=lambda r: r.amount)
+            if p[1] is not None
+        ]
+        if cost_points:
+            cost_stats = _rows_to_statistics(cost_points)
+            async_import_statistics(hass, _cost_metadata(cost_id), cost_stats)
+            _LOGGER.info(
+                "Imported %s day-resolution cost statistics for %s",
+                len(cost_points),
+                cost_id,
+            )
+            # The cost entity's native rows (recorder-seeded) may sit on a
+            # zeroed baseline; align them onto the imported chain end.
+            current_cost = (coordinator.data or {}).get("cumulative_cost")
+            if current_cost is not None:
+                await _async_align_native_block(
+                    hass,
+                    cost_id,
+                    cost_stats[-1]["start"],
+                    round(current_cost, 2),
+                )
     await coordinator.mark_stats_imported()
 
 
 async def async_backfill_hourly_statistics(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: NBPowerCoordinator
 ) -> None:
-    """Import hourly statistics for published days, resumable and repeatable.
+    """Import hourly statistics for published days, resumable and repeatable."""
+    if _import_lock.locked():
+        _LOGGER.debug("Statistics import already running; skipping")
+        return
+    async with _import_lock:
+        await _async_import_hourly(hass, entry, coordinator)
 
-    Runs once at setup for the historical backfill and again after every
-    coordinator refresh: the 15-minute feed publishes a day's data only
-    after that day ends, so each refresh picks up the newly published days
-    (usually yesterday). Rows chain cumulative sums from the persisted
-    seed; afterwards the sensor's monotonic floor is raised to the chain
-    end and any native recorder rows after the chain are flattened onto it
-    — without that, the energy of each newly imported day would also be
-    recorded as one lump at the refresh hour (double count).
-    """
+
+async def _async_import_hourly(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: NBPowerCoordinator
+) -> None:
     statistic_id = _energy_statistic_id(hass, entry)
     if statistic_id is None:
         return
@@ -242,18 +295,6 @@ async def async_backfill_hourly_statistics(
                     len(points),
                 )
                 break
-        else:
-            # Days this close to now have not validated yet; stop here and
-            # let a later run pick them up once the portal publishes them.
-            if (today - day).days <= 14:
-                _LOGGER.info(
-                    "Hourly backfill reached unpublished data at %s "
-                    "(imported %s hourly rows so far)",
-                    day,
-                    imported,
-                )
-                await coordinator.store_interval_through(day - timedelta(days=1))
-                return
 
         await coordinator.store_interval_through(day)
         day += timedelta(days=1)

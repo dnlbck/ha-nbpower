@@ -581,3 +581,33 @@ async def test_partial_day_not_marked_complete(
     )
     expected = sum(r["Consumption"] for r in _interval_rows(partial_day))
     assert day_change == pytest.approx(expected, abs=0.05)  # counted exactly once
+
+
+async def test_cost_history_imported(
+    recorder_mock,
+    hass,
+    portal,
+    nbpower_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """Cost statistics get the same day-resolution history as energy."""
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.statistics import statistics_during_period
+
+    entry = await _setup_entry(hass, portal, nbpower_urls, backfill_hourly=False)
+    await get_instance(hass).async_block_till_done()
+
+    cost_id = _entity_id(hass, entry, "cost_usage")
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, dt_util.utc_from_timestamp(0), dt_util.now(),
+        (cost_id,), "hour", None, {"state", "sum"},
+    )
+    rows = sorted(stats[cost_id], key=lambda r: r["start"])
+    sums = [r["sum"] for r in rows]
+    changes = [b - a for a, b in zip([0.0] + sums[:-1], sums)]
+    assert len(rows) > 700  # three years of daily cost rows
+    assert min(changes) >= 0
+    # The cost chain ends at the sensor's own value (same books inputs).
+    sensor_cost = float(hass.states.get(cost_id).state)
+    assert sums[-1] == pytest.approx(sensor_cost, abs=1.0)
