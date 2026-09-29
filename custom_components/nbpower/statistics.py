@@ -315,12 +315,21 @@ async def _async_import_hourly(
     if frontier is None and coordinator.stored_interval_through() is not None:
         await coordinator.store_stats_frontier(dt_util.now())
         _LOGGER.info("Statistics frontier pinned; recorder owns hours from here")
-    # Align the recorder-owned block after the chain onto the chain end
-    # (a no-op once aligned; re-anchors the native block if it drifts).
+    # Align the recorder-owned blocks after the chain onto the chain ends
+    # (a no-op once aligned; re-anchors the native block if it drifts —
+    # the recorder's own baseline can restart at zero after restarts).
     if coordinator.stored_interval_through() is not None:
         await _async_align_native_block(
             hass, statistic_id, last_imported_start, round(seed, 3)
         )
+        cost_id = er.async_get(hass).async_get_entity_id(
+            "sensor", DOMAIN, UNIQUE_ID_TEMPLATE.format(entry_id=entry.entry_id, key=COST_KEY)
+        )
+        current_cost = (coordinator.data or {}).get("cumulative_cost")
+        if cost_id and current_cost is not None and frontier is not None:
+            await _async_align_native_block(
+                hass, cost_id, frontier, round(current_cost, 2)
+            )
 
 
 def _row_ts(value: datetime | float) -> float:
