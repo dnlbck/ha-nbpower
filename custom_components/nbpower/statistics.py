@@ -371,23 +371,41 @@ async def _async_align_native_block(
     result = await get_instance(hass).async_add_executor_job(
         get_last_statistics, hass, 72, statistic_id, True, {"sum"}
     )
-    tail = sorted(
-        (r for r in (result.get(statistic_id) or []) if _row_ts(r["start"]) > after.timestamp()),
-        key=lambda r: _row_ts(r["start"]),
+    all_rows = sorted(
+        (result.get(statistic_id) or []), key=lambda r: _row_ts(r["start"])
     )
+    tail = [r for r in all_rows if _row_ts(r["start"]) > after.timestamp()]
     if not tail:
         return
-    first_sum = tail[0].get("sum") or 0.0
-    gap = round(chain_end - first_sum, 3)
-    if abs(gap) < 0.01:
-        return
+    # Anchor the running level to the actual last row at or before the
+    # walk window — the chain's last WRITTEN row (a partial day can sit
+    # above the persisted complete-days seed).
+    prior = [r for r in all_rows if _row_ts(r["start"]) <= after.timestamp()]
+    level = round(prior[-1].get("sum") or 0.0, 3) if prior else chain_end
+
+    # Walk the native block from the chain end, repairing every interior
+    # dip. Restarts make the recorder recompile recent hours from its own
+    # baseline, which can re-open seams anywhere in the block; a single
+    # base shift is not enough. Sensor increases are preserved (the
+    # running level simply rises); only decreases are pinned back up.
     instance = get_instance(hass)
-    await instance.async_add_executor_job(
-        adjust_statistics, instance, statistic_id, _row_dt(tail[0]["start"]), gap, "kWh"
-    )
-    _LOGGER.info(
-        "Aligned native statistics block for %s by %+.3f kWh at %s",
-        statistic_id,
-        gap,
-        tail[0]["start"],
-    )
+    for row in tail:
+        row_sum = row.get("sum") or 0.0
+        deficit = round(level - row_sum, 3)
+        if deficit > 0.01:
+            await instance.async_add_executor_job(
+                adjust_statistics,
+                instance,
+                statistic_id,
+                _row_dt(row["start"]),
+                deficit,
+                "kWh",
+            )
+            _LOGGER.info(
+                "Repaired native statistics dip for %s at %s (+%.3f)",
+                statistic_id,
+                row["start"],
+                deficit,
+            )
+        elif row_sum > level:
+            level = row_sum
