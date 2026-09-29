@@ -20,6 +20,7 @@ from .api import NBPowerClient, UsageRow
 from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    MI_SINCE_DAYS,
     MIN_SCAN_INTERVAL,
     REPAIR_GEN,
     STORAGE_KEY,
@@ -81,6 +82,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._interval_through: date | None = None
         self._interval_state_seed: float | None = None
         self._stats_frontier: datetime | None = None
+        self._frontier_end: float | None = None
         self._last_cumulative_kwh: float | None = None
         self._last_cumulative_cost: float | None = None
 
@@ -112,6 +114,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if raw.get("stats_frontier")
             else None
         )
+        self._frontier_end = raw.get("frontier_end")
         self._last_cumulative_kwh = raw.get("last_cumulative_kwh")
         self._last_cumulative_cost = raw.get("last_cumulative_cost")
 
@@ -133,6 +136,10 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Running total the hourly backfill's state series continues from."""
         return self._interval_state_seed
 
+    @property
+    def _interval_seed(self) -> float | None:
+        return self._interval_state_seed
+
     def stored_stats_frontier(self):
         """The datetime after which the recorder owns all statistics.
 
@@ -142,8 +149,17 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         return self._stats_frontier
 
-    async def store_stats_frontier(self, frontier: datetime) -> None:
+    async def store_stats_frontier(self, frontier: datetime, chain_end: float) -> None:
         self._stats_frontier = frontier
+        self._frontier_end = round(chain_end, 3)
+        await self._async_save_stored()
+
+    def stored_frontier_end(self) -> float | None:
+        """Chain cumulative at the frontier — the sensor's anchor."""
+        return self._frontier_end
+
+    async def store_frontier_end(self, value: float) -> None:
+        self._frontier_end = round(value, 3)
         await self._async_save_stored()
 
     async def store_interval_state_seed(self, seed: float) -> None:
@@ -167,6 +183,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if self._stats_frontier
                     else None
                 ),
+                "frontier_end": self._frontier_end,
                 "last_cumulative_kwh": self._last_cumulative_kwh,
                 "last_cumulative_cost": self._last_cumulative_cost,
             }
@@ -245,21 +262,49 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             (row.start.date() for row in daily if row.kwh is not None), default=None
         )
 
-        # The daily books lag several days and can even drop days that are
-        # later re-booked at cycle close. The 15-minute feed publishes a
-        # day's data only after that day ends, so only TODAY can be folded
-        # into the cumulative here — older unpublished days are imported
-        # with their real hours by the statistics extension instead.
+        # ONE LEDGER for the energy sensor: the 15-minute interval feed,
+        # anchored at the statistics frontier. The books-based cumulative
+        # double counts when the portal restructures its ledger (posting a
+        # billing cycle converts the daily window into a cycle total — a
+        # jump of hundreds of kWh that the imported chain already
+        # counted). Post-frontier intervals are not imported (the
+        # recorder owns those hours), but they still drive the VALUE.
+        frontier = self.stored_stats_frontier()
         recent_days: dict[date, float] = {}
         today_kwh = 0.0
-        try:
-            rows = await self.client.get_interval_usage(today)
-            if rows:
-                today_kwh = round(sum(row.kwh or 0.0 for row in rows), 3)
-                recent_days[today] = today_kwh
-        except NBPowerApiError:
-            _LOGGER.debug("No 15-minute data published for today yet")
-        recent_kwh = today_kwh
+        mi_since = 0.0
+        if frontier is not None and self.stored_frontier_end() is None:
+            # Migration for entries pinned before frontier_end existed:
+            # seed + the frontier day's pre-frontier intervals.
+            try:
+                day_rows = await self.client.get_interval_usage(frontier.date())
+                pre = sum(
+                    row.kwh or 0.0 for row in day_rows if row.start < frontier
+                )
+                await self.store_frontier_end(
+                    (self._interval_seed or 0.0) + round(pre, 3)
+                )
+            except NBPowerApiError:
+                _LOGGER.debug("Could not migrate frontier end yet")
+        frontier_end = self.stored_frontier_end()
+        if frontier is not None and frontier_end is not None:
+            try:
+                day = frontier.date()
+                while day <= today and (today - day).days <= MI_SINCE_DAYS:
+                    rows = await self.client.get_interval_usage(day)
+                    for row in rows:
+                        if row.start >= frontier:
+                            mi_since += row.kwh or 0.0
+                            if row.start.date() == today:
+                                today_kwh += row.kwh or 0.0
+                    day += timedelta(days=1)
+                mi_since = round(mi_since, 3)
+                today_kwh = round(today_kwh, 3)
+                if today_kwh:
+                    recent_days[today] = today_kwh
+            except NBPowerApiError:
+                _LOGGER.debug("Interval feed unavailable; sensor holds")
+        recent_kwh = mi_since
 
         def _post_cycle(value) -> float:
             return sum(
@@ -270,6 +315,8 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
         books_kwh = round(sum(row.kwh or 0.0 for row in monthly) + _post_cycle(lambda r: r.kwh), 2)
+        if frontier is not None and frontier_end is not None:
+            books_kwh = round(frontier_end + recent_kwh, 2)
         books_cost = round(
             sum(row.amount or 0.0 for row in monthly) + _post_cycle(lambda r: r.amount), 2
         )

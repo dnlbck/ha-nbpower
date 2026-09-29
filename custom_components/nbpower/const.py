@@ -30,6 +30,10 @@ INTERVAL_REQUEST_PAUSE = 0.25
 # cumulative sensor is what makes "today" advance between book updates.
 MI_RECENT_DAYS = 7
 
+# How many days of interval data to scan for the sensor value (the
+# frontier anchor plus post-frontier usage).
+MI_SINCE_DAYS = 10
+
 CONF_BACKFILL_HOURLY = "backfill_hourly"
 
 STORAGE_KEY = "nbpower"
@@ -37,4 +41,4 @@ STORAGE_VERSION = 1
 
 # Bump to force one clean re-import of all statistics (day rows + hourly
 # upgrade) after changes to the state-chaining convention.
-REPAIR_GEN = 8
+REPAIR_GEN = 9
