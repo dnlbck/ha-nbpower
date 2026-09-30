@@ -669,3 +669,147 @@ async def test_stats_frontier_pins_and_limits_imports(
     after_f = [r for r in rows_after if r["start"] >= frontier_ts]
     assert before_f, "pre-frontier history present"
     assert len(after_f) <= len([r for r in rows_before if r["start"] >= frontier_ts])
+
+
+async def test_frontier_day_prefrontier_hours_imported_and_anchor_syncs(
+    recorder_mock,
+    hass,
+    portal,
+    nbpower_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """A mid-day frontier splits its day; both halves end up counted once.
+
+    The pre-frontier hours are import-owned (nothing else will ever write
+    them after a restart wipes the recorder's short-term coverage), the
+    post-frontier hours drive the sensor from the chain-end anchor, and
+    the anchor syncs forward when the chain grows under the frontier.
+    """
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.statistics import statistics_during_period
+
+    from conftest import _interval_rows
+
+    entry = await _setup_entry(hass, portal, nbpower_urls, backfill_hourly=False)
+    coordinator = entry.runtime_data
+    await get_instance(hass).async_block_till_done()
+
+    # A chain through the day before yesterday; frontier pinned at local
+    # noon YESTERDAY (mid-day, like a restart-time pin). Seed far above
+    # the mock books so the monotonic floor never engages.
+    frontier_day = date.today() - timedelta(days=1)
+    frontier = dt_util.start_of_local_day(frontier_day).replace(hour=12)
+    seed = 80000.0
+    await coordinator.store_interval_state_seed(seed)
+    await coordinator.store_interval_through(frontier_day - timedelta(days=1))
+    await coordinator.store_stats_frontier(frontier, seed)
+
+    await coordinator.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await get_instance(hass).async_block_till_done()
+    # Second refresh: the first one synced the anchor mid-flight.
+    await coordinator.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await get_instance(hass).async_block_till_done()
+
+    rows_by_day = await _stats_rows(hass, _entity_id(hass, entry, ENERGY_KEY))
+    day_rows = rows_by_day.get(frontier_day, [])
+    hours = [dt_util.as_local(dt_util.utc_from_timestamp(r["start"])).hour for r in day_rows]
+    assert hours == list(range(12))  # pre-frontier hours only
+
+    quarters = _interval_rows(frontier_day)
+    pre = sum(r["Consumption"] for r in quarters if int(r["Hourly"][:2]) < 12)
+    post = sum(r["Consumption"] for r in quarters if int(r["Hourly"][:2]) >= 12)
+
+    # The day completed under the frontier: through advanced and the seed
+    # and the sensor's anchor (frontier_end) both track the chain end —
+    # not the stale pin-time value.
+    assert coordinator.stored_interval_through() == frontier_day
+    assert coordinator.stored_interval_state_seed() == pytest.approx(seed + pre, abs=0.05)
+    assert coordinator.stored_frontier_end() == pytest.approx(seed + pre, abs=0.05)
+
+    # Sensor = anchor + post-frontier intervals, counted exactly once
+    # (the v0.10.1 live bug double-added them).
+    sensor = float(hass.states.get(_entity_id(hass, entry, ENERGY_KEY)).state)
+    assert sensor == pytest.approx(seed + pre + post, abs=0.15)
+
+
+async def _stats_rows(hass, statistic_id: str) -> dict[date, list[dict]]:
+    """All statistics rows for an entity, grouped by local day."""
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.statistics import statistics_during_period
+
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period, hass, dt_util.utc_from_timestamp(0), dt_util.now(),
+        (statistic_id,), "hour", None, {"state", "sum"},
+    )
+    grouped: dict[date, list[dict]] = {}
+    for row in sorted(stats[statistic_id], key=lambda r: r["start"]):
+        day = dt_util.as_local(dt_util.utc_from_timestamp(row["start"])).date()
+        grouped.setdefault(day, []).append(row)
+    return grouped
+
+
+async def test_align_lifts_reseeded_native_block_exactly_once(
+    recorder_mock,
+    hass,
+    portal,
+    nbpower_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """A recorder block that re-seeded below the chain is lifted once.
+
+    ``adjust_statistics`` shifts the target row AND every later row (both
+    tables). The walker must fold that into its cached sums or each
+    consecutive repair compounds off stale values and balloons the tail —
+    the phantom double +69k hours seen live on 2026-09-29.
+    """
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.models import (
+        StatisticData,
+        StatisticMetaData,
+        StatisticMeanType,
+    )
+    from homeassistant.components.recorder.statistics import async_import_statistics
+
+    from custom_components.nbpower.statistics import _async_align_native_block
+
+    entry = await _setup_entry(hass, portal, nbpower_urls, backfill_hourly=False)
+    await get_instance(hass).async_block_till_done()
+    statistic_id = _entity_id(hass, entry, ENERGY_KEY)
+
+    meta = StatisticMetaData(
+        mean_type=StatisticMeanType.NONE,
+        has_sum=True,
+        name=None,
+        source="recorder",
+        statistic_id=statistic_id,
+        unit_class="energy",
+        unit_of_measurement="kWh",
+    )
+    midnight = dt_util.start_of_local_day(date.today())
+    async_import_statistics(
+        hass,
+        meta,
+        [
+            StatisticData(start=midnight, state=100.0, sum=100.0),      # chain end
+            StatisticData(start=midnight + timedelta(hours=1), state=0.0, sum=40.0),   # re-seeded
+            StatisticData(start=midnight + timedelta(hours=2), state=40.0, sum=42.0),
+            StatisticData(start=midnight + timedelta(hours=3), state=42.0, sum=41.0),  # interior dip
+        ],
+    )
+    await get_instance(hass).async_block_till_done()
+
+    await _async_align_native_block(hass, statistic_id, midnight, 100.0)
+    await get_instance(hass).async_block_till_done()
+
+    rows = (await _stats_rows(hass, statistic_id))[date.today()]
+    sums = {dt_util.as_local(dt_util.utc_from_timestamp(r["start"])).hour: r["sum"] for r in rows}
+    # Lifted onto the chain end once; interior delta (42-40) preserved and
+    # the dip repaired to the running level — no compounding.
+    assert sums[0] == pytest.approx(100.0, abs=0.01)
+    assert sums[1] == pytest.approx(100.0, abs=0.01)
+    assert sums[2] == pytest.approx(102.0, abs=0.01)
+    assert sums[3] == pytest.approx(102.0, abs=0.01)

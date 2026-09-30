@@ -38,7 +38,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .api import UsageRow
-from .const import DOMAIN, INTERVAL_BACKFILL_DAYS, INTERVAL_REQUEST_PAUSE
+from .const import DOMAIN, INTERVAL_BACKFILL_DAYS, INTERVAL_REQUEST_PAUSE, MI_SINCE_DAYS
 from .coordinator import NBPowerCoordinator
 from .exceptions import NBPowerError
 from .sensor import COST_KEY, ENERGY_KEY, UNIQUE_ID_TEMPLATE
@@ -178,9 +178,10 @@ async def async_import_history_statistics(
             "Imported %s day-resolution statistics for %s", len(points), statistic_id
         )
 
-    # Cost history: cycles and daily rows carry dollar amounts; the cost
-    # entity's books are exactly these inputs, so the imported chain ends
-    # at the sensor's own value — no seam alignment needed.
+    # Cost history: cycles and daily rows carry dollar amounts. The chain
+    # ends at the books' own cumulative through the last imported day;
+    # persist it so later alignment passes anchor there (not at the
+    # sensor's current total, which also counts post-import books).
     cost_id = er.async_get(hass).async_get_entity_id(
         "sensor", DOMAIN, UNIQUE_ID_TEMPLATE.format(entry_id=entry.entry_id, key=COST_KEY)
     )
@@ -193,21 +194,21 @@ async def async_import_history_statistics(
         if cost_points:
             cost_stats = _rows_to_statistics(cost_points)
             async_import_statistics(hass, _cost_metadata(cost_id), cost_stats)
+            cost_chain_end = cost_stats[-1]["sum"] or 0.0
+            await coordinator.store_cost_chain_end(round(cost_chain_end, 2))
             _LOGGER.info(
                 "Imported %s day-resolution cost statistics for %s",
                 len(cost_points),
                 cost_id,
             )
-            # The cost entity's native rows (recorder-seeded) may sit on a
-            # zeroed baseline; align them onto the imported chain end.
-            current_cost = (coordinator.data or {}).get("cumulative_cost")
-            if current_cost is not None:
-                await _async_align_native_block(
-                    hass,
-                    cost_id,
-                    cost_stats[-1]["start"],
-                    round(current_cost, 2),
-                )
+            # The cost entity's native rows (recorder-seeded) sit on a
+            # zeroed baseline; lift them onto the imported chain end.
+            await _async_align_native_block(
+                hass,
+                cost_id,
+                cost_stats[-1]["start"],
+                round(cost_chain_end, 2),
+            )
     await coordinator.mark_stats_imported()
 
 
@@ -236,8 +237,11 @@ async def _async_import_hourly(
     # The recorder owns everything from the frontier onward; the import
     # never writes those hours (rewrites there get reverted and create
     # negative seams). On first completion the frontier is pinned to now.
+    # The frontier DAY itself is half import-owned: its pre-frontier hours
+    # predate the recorder's first row, so nothing else will ever write
+    # them (a restart or statistics clear mid-day wipes the recorder's
+    # coverage of those hours) — the import must fill them once published.
     frontier = coordinator.stored_stats_frontier()
-    day_limit = min(frontier.date(), today) if frontier else today
 
     # Seed the hourly state series where the day-resolution series left
     # off: everything phase 1 recorded strictly before the first hour row.
@@ -254,7 +258,13 @@ async def _async_import_hourly(
     imported = 0
     day = resume_from
     last_imported_start: datetime | None = None
-    while day < day_limit:
+    while True:
+        frontier_day = frontier is not None and day == frontier.date()
+        if frontier is not None and day > frontier.date():
+            # Post-frontier days belong to the recorder entirely.
+            break
+        if day >= today and not frontier_day:
+            break
         try:
             rows = await client.get_interval_usage(day)
         except (NBPowerError, TimeoutError, OSError) as err:
@@ -267,26 +277,49 @@ async def _async_import_hourly(
             return
 
         if rows:
-            points = hourly_points(rows)
-            statistics: list[StatisticData] = []
-            day_seed = seed
-            for when, kwh in points:
-                start = dt_util.as_local(when)
-                statistics.append(
-                    StatisticData(
-                        start=start,
-                        state=round(day_seed, 3),
-                        sum=round(day_seed + kwh, 3),
+            raw_points = hourly_points(rows)
+            points = raw_points
+            if frontier_day:
+                # Keep only the import-owned hours: those that END at or
+                # before the frontier. (The frontier can sit mid-hour; the
+                # straddling hour's data stays split — its pre-frontier
+                # quarter-hours are bounded, one-time loss.)
+                points = [
+                    (when, kwh)
+                    for when, kwh in points
+                    if dt_util.as_local(when) + timedelta(hours=1) <= frontier
+                ]
+            if points:
+                statistics: list[StatisticData] = []
+                day_seed = seed
+                for when, kwh in points:
+                    start = dt_util.as_local(when)
+                    statistics.append(
+                        StatisticData(
+                            start=start,
+                            state=round(day_seed, 3),
+                            sum=round(day_seed + kwh, 3),
+                        )
                     )
+                    last_imported_start = start
+                    day_seed += kwh
+                async_import_statistics(hass, _metadata(statistic_id), statistics)
+                imported += len(points)
+
+            if frontier_day:
+                # Complete once publication has caught up PAST the frontier
+                # (the frontier can sit mid-hour, so the last full
+                # import-owned hour ends before it).
+                complete = any(
+                    dt_util.as_local(when) + timedelta(hours=1) > frontier
+                    for when, _kwh in raw_points
                 )
-                last_imported_start = start
-                day_seed += kwh
-            async_import_statistics(hass, _metadata(statistic_id), statistics)
-            imported += len(points)
-            if len(points) >= 24:
+            else:
+                complete = len(points) >= 24
+            if complete:
                 # Complete day: advance the persisted chain; the next run
                 # continues from here.
-                seed = day_seed
+                seed += sum(kwh for _, kwh in points)
                 await coordinator.store_interval_state_seed(round(seed, 3))
             else:
                 # The portal publishes days partially. This is the feed's
@@ -295,11 +328,19 @@ async def _async_import_hourly(
                 # idempotently) and stop — later days cannot be trusted
                 # to be complete either.
                 _LOGGER.info(
-                    "Day %s partially published (%s of 24 hours); will re-fetch",
+                    "Day %s partially published (%s hours); will re-fetch",
                     day,
                     len(points),
                 )
                 break
+        elif (today - day).days > MI_SINCE_DAYS:
+            # Old day with nothing published; skip it permanently.
+            pass
+        else:
+            # Recent day not published yet (the feed lags; unpublished days
+            # come back empty). Do NOT mark it through — retried next pass.
+            _LOGGER.info("Day %s not published yet; will retry", day)
+            break
 
         await coordinator.store_interval_through(day)
         day += timedelta(days=1)
@@ -315,21 +356,44 @@ async def _async_import_hourly(
     if frontier is None and coordinator.stored_interval_through() is not None:
         await coordinator.store_stats_frontier(dt_util.now(), seed)
         _LOGGER.info("Statistics frontier pinned; recorder owns hours from here")
+    elif frontier is not None:
+        # The chain may have grown under the frontier since it was pinned
+        # (days that only completed publishing after the pin): the sensor's
+        # anchor must track the chain end, not the stale pin-time value.
+        frontier_end = coordinator.stored_frontier_end()
+        if frontier_end is None or round(seed, 3) > frontier_end:
+            await coordinator.store_frontier_end(round(seed, 3))
     # Align the recorder-owned blocks after the chain onto the chain ends
     # (a no-op once aligned; re-anchors the native block if it drifts —
     # the recorder's own baseline can restart at zero after restarts).
-    if coordinator.stored_interval_through() is not None:
-        await _async_align_native_block(
-            hass, statistic_id, last_imported_start, round(seed, 3)
-        )
+    through = coordinator.stored_interval_through()
+    if through is not None:
+        after = last_imported_start
+        if after is None:
+            after = dt_util.start_of_local_day(through) + timedelta(hours=23)
+        await _async_align_native_block(hass, statistic_id, after, round(seed, 3))
         cost_id = er.async_get(hass).async_get_entity_id(
             "sensor", DOMAIN, UNIQUE_ID_TEMPLATE.format(entry_id=entry.entry_id, key=COST_KEY)
         )
-        current_cost = (coordinator.data or {}).get("cumulative_cost")
-        if cost_id and current_cost is not None and frontier is not None:
-            await _async_align_native_block(
-                hass, cost_id, frontier, round(current_cost, 2)
-            )
+        if cost_id and frontier is not None:
+            # Anchor the cost alignment at the imported chain end, NOT the
+            # sensor's current total: the recorder block legitimately sits
+            # above the chain end by the deltas it captured since its
+            # zero-point, and lifting it to the sensor total would count
+            # the pre-import books gap twice. Entries that predate the
+            # persisted anchor derive it once from the chain's last row
+            # before the frontier, then keep it in storage.
+            cost_chain_end = coordinator.stored_cost_chain_end()
+            if cost_chain_end is None:
+                cost_chain_end = await _async_derive_cost_chain_end(
+                    hass, cost_id, frontier
+                )
+                if cost_chain_end is not None:
+                    await coordinator.store_cost_chain_end(round(cost_chain_end, 3))
+            if cost_chain_end is not None:
+                await _async_align_native_block(
+                    hass, cost_id, frontier, round(cost_chain_end, 2)
+                )
 
 
 def _row_ts(value: datetime | float) -> float:
@@ -337,6 +401,24 @@ def _row_ts(value: datetime | float) -> float:
     if isinstance(value, datetime):
         return value.timestamp()
     return float(value)
+
+
+async def _async_derive_cost_chain_end(
+    hass: HomeAssistant, statistic_id: str, before: datetime
+) -> float | None:
+    """The imported cost chain's cumulative: its last row before ``before``."""
+    from homeassistant.components.recorder.statistics import get_last_statistics
+
+    result = await get_instance(hass).async_add_executor_job(
+        get_last_statistics, hass, 72, statistic_id, True, {"sum"}
+    )
+    rows = sorted(
+        (result.get(statistic_id) or []), key=lambda r: _row_ts(r["start"])
+    )
+    prior = [r for r in rows if _row_ts(r["start"]) <= before.timestamp()]
+    if not prior:
+        return None
+    return round(prior[-1].get("sum") or 0.0, 3)
 
 
 def _row_dt(value: datetime | float) -> datetime:
@@ -350,7 +432,7 @@ async def _async_align_native_block(
     hass: HomeAssistant,
     statistic_id: str,
     after: datetime | None,
-    chain_end: float,
+    chain_end: float | None,
 ) -> None:
     """Shift native recorder rows after the imported chain onto ``chain_end``.
 
@@ -360,6 +442,12 @@ async def _async_align_native_block(
     future recompiles consistent. Without this, the first native row after
     the imported chain sits at the books-fed sensor level, below the
     interval-fed chain, rendering as a negative bar at the seam.
+
+    ``adjust_statistics`` shifts the target row AND every later row (both
+    tables) by the same amount, so after each repair the cached sums of
+    the remaining tail rows must be moved up by the same deficit —
+    otherwise consecutive repairs compound off stale values and massively
+    over-shift the tail.
     """
     if after is None:
         return
@@ -377,25 +465,25 @@ async def _async_align_native_block(
     tail = [r for r in all_rows if _row_ts(r["start"]) > after.timestamp()]
     if not tail:
         return
-    # Anchor the running level to the actual last row at or before the
-    # walk window — the chain's last WRITTEN row (a partial day can sit
-    # above the persisted complete-days seed).
-    prior = [r for r in all_rows if _row_ts(r["start"]) <= after.timestamp()]
-    level = round(prior[-1].get("sum") or 0.0, 3) if prior else chain_end
 
-    # Walk the native block from the chain end, repairing every interior
-    # dip. Restarts make the recorder recompile recent hours from its own
-    # baseline, which can re-open seams anywhere in the block; a single
-    # base shift is not enough. Sensor increases are preserved (the
-    # running level simply rises); only decreases are pinned back up.
-    instance = get_instance(hass)
-    for row in tail:
-        row_sum = row.get("sum") or 0.0
+    # Anchor the running level at the imported chain end. A native block
+    # sitting at/below it re-seeded from zero (the recorder restarts its
+    # baseline after a statistics clear or a short-term purge); one lift
+    # restores its internal deltas, which were always correct. When the
+    # chain end is unknown (None), the last row at/before ``after`` — the
+    # last imported row — anchors instead.
+    if chain_end is not None:
+        level = round(chain_end, 3)
+    else:
+        prior = [r for r in all_rows if _row_ts(r["start"]) <= after.timestamp()]
+        level = round(prior[-1].get("sum") or 0.0, 3) if prior else 0.0
+    for i, row in enumerate(tail):
+        row_sum = round(row.get("sum") or 0.0, 3)
         deficit = round(level - row_sum, 3)
         if deficit > 0.01:
-            await instance.async_add_executor_job(
+            await get_instance(hass).async_add_executor_job(
                 adjust_statistics,
-                instance,
+                get_instance(hass),
                 statistic_id,
                 _row_dt(row["start"]),
                 deficit,
@@ -407,5 +495,10 @@ async def _async_align_native_block(
                 row["start"],
                 deficit,
             )
+            # The adjust shifted every later row too; keep the cached tail
+            # consistent so subsequent deficits are computed from reality.
+            for later in tail[i + 1 :]:
+                if later.get("sum") is not None:
+                    later["sum"] = later["sum"] + deficit
         elif row_sum > level:
             level = row_sum

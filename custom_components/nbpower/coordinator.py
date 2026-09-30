@@ -83,6 +83,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._interval_state_seed: float | None = None
         self._stats_frontier: datetime | None = None
         self._frontier_end: float | None = None
+        self._cost_chain_end: float | None = None
         self._last_cumulative_kwh: float | None = None
         self._last_cumulative_cost: float | None = None
 
@@ -115,6 +116,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else None
         )
         self._frontier_end = raw.get("frontier_end")
+        self._cost_chain_end = raw.get("cost_chain_end")
         self._last_cumulative_kwh = raw.get("last_cumulative_kwh")
         self._last_cumulative_cost = raw.get("last_cumulative_cost")
 
@@ -162,6 +164,14 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._frontier_end = round(value, 3)
         await self._async_save_stored()
 
+    def stored_cost_chain_end(self) -> float | None:
+        """Cumulative of the last imported cost-history row."""
+        return self._cost_chain_end
+
+    async def store_cost_chain_end(self, value: float) -> None:
+        self._cost_chain_end = round(value, 3)
+        await self._async_save_stored()
+
     async def store_interval_state_seed(self, seed: float) -> None:
         """Persist the hourly-backfill state seed (continues phase-1 series)."""
         self._interval_state_seed = seed
@@ -184,6 +194,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     else None
                 ),
                 "frontier_end": self._frontier_end,
+                "cost_chain_end": self._cost_chain_end,
                 "last_cumulative_kwh": self._last_cumulative_kwh,
                 "last_cumulative_cost": self._last_cumulative_cost,
             }
@@ -278,8 +289,12 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # seed + the frontier day's pre-frontier intervals.
             try:
                 day_rows = await self.client.get_interval_usage(frontier.date())
+                # Interval rows carry naive local timestamps; the frontier
+                # is aware — normalize before comparing.
                 pre = sum(
-                    row.kwh or 0.0 for row in day_rows if row.start < frontier
+                    row.kwh or 0.0
+                    for row in day_rows
+                    if dt_util.as_local(row.start) < frontier
                 )
                 await self.store_frontier_end(
                     (self._interval_seed or 0.0) + round(pre, 3)
@@ -293,7 +308,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 while day <= today and (today - day).days <= MI_SINCE_DAYS:
                     rows = await self.client.get_interval_usage(day)
                     for row in rows:
-                        if row.start >= frontier:
+                        if dt_util.as_local(row.start) >= frontier:
                             mi_since += row.kwh or 0.0
                             if row.start.date() == today:
                                 today_kwh += row.kwh or 0.0
@@ -325,7 +340,9 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # dashboard treats a decreasing total_increasing sensor as a meter
         # reset (huge spikes). Hold the last value until the books catch
         # back up instead — under-counting slightly beats going backwards.
-        derived_kwh = round(books_kwh + recent_kwh, 2)
+        # books_kwh already includes recent_kwh when the frontier is active;
+        # adding it again would double-count the post-frontier usage.
+        derived_kwh = books_kwh
         cumulative_kwh = (
             max(derived_kwh, self._last_cumulative_kwh)
             if self._last_cumulative_kwh is not None
