@@ -722,17 +722,21 @@ async def test_frontier_day_prefrontier_hours_imported_and_anchor_syncs(
     pre = sum(r["Consumption"] for r in quarters if int(r["Hourly"][:2]) < 12)
     post = sum(r["Consumption"] for r in quarters if int(r["Hourly"][:2]) >= 12)
 
-    # The day completed under the frontier: through advanced and the seed
-    # and the sensor's anchor (frontier_end) both track the chain end —
-    # not the stale pin-time value.
+    # The day completed under the frontier: through advanced and the CHAIN
+    # (seed) grew to include the morning hours — but the sensor's anchor
+    # (frontier_end) stays PINNED. Raising it would step the sensor for
+    # hours the chain already carries below the frontier, and the recorder
+    # books sensor steps as consumption — a double-count. The sensor
+    # instead trails the chain by the below-frontier import (cosmetic;
+    # the dashboard reads the chain).
     assert coordinator.stored_interval_through() == frontier_day
     assert coordinator.stored_interval_state_seed() == pytest.approx(seed + pre, abs=0.05)
-    assert coordinator.stored_frontier_end() == pytest.approx(seed + pre, abs=0.05)
+    assert coordinator.stored_frontier_end() == pytest.approx(seed, abs=0.001)
 
-    # Sensor = anchor + post-frontier intervals, counted exactly once
-    # (the v0.10.1 live bug double-added them).
+    # Sensor = pinned anchor + post-frontier intervals, counted exactly
+    # once (the v0.10.1 live bug double-added them).
     sensor = float(hass.states.get(_entity_id(hass, entry, ENERGY_KEY)).state)
-    assert sensor == pytest.approx(seed + pre + post, abs=0.15)
+    assert sensor == pytest.approx(seed + post, abs=0.15)
 
 
 async def _stats_rows(hass, statistic_id: str) -> dict[date, list[dict]]:

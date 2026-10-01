@@ -356,13 +356,6 @@ async def _async_import_hourly(
     if frontier is None and coordinator.stored_interval_through() is not None:
         await coordinator.store_stats_frontier(dt_util.now(), seed)
         _LOGGER.info("Statistics frontier pinned; recorder owns hours from here")
-    elif frontier is not None:
-        # The chain may have grown under the frontier since it was pinned
-        # (days that only completed publishing after the pin): the sensor's
-        # anchor must track the chain end, not the stale pin-time value.
-        frontier_end = coordinator.stored_frontier_end()
-        if frontier_end is None or round(seed, 3) > frontier_end:
-            await coordinator.store_frontier_end(round(seed, 3))
     # Align the recorder-owned blocks after the chain onto the chain ends
     # (a no-op once aligned; re-anchors the native block if it drifts —
     # the recorder's own baseline can restart at zero after restarts).
