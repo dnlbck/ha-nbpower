@@ -23,7 +23,7 @@ against live traffic.
 - Username/password sign-in with automatic session renewal (tokens expire
   within hours; the integration just logs in again)
 - **Energy dashboard ready**: hourly energy and cost statistics
-  (`NB Power <account> energy` / `cost`) that put every hour's usage in
+  (**NB Power energy** / **NB Power cost**) that put every hour's usage in
   the hour it happened, as soon as the portal publishes it — even though
   the portal publishes a day or more late, and sometimes out of order
 - **~3 years of history**: all published billing cycles (~36 months) at day
@@ -59,13 +59,14 @@ The energy usage sensor also exposes `account_number`, `meter_number`,
 
 | Statistic | Unit | Description |
 |---|---|---|
-| `nbpower:energy_<account>` (**NB Power \<account\> energy**) | kWh | **Use this for grid consumption.** Hourly usage for the last year, day resolution before that. |
-| `nbpower:cost_<account>` (**NB Power \<account\> cost**) | CAD | **Use this as the consumption's cost.** The portal's per-hour dollars (energy charge only, rounded to the cent). |
+| `nbpower:energy_<tag>` (**NB Power energy**) | kWh | **Use this for grid consumption.** Hourly usage for the last year, day resolution before that. |
+| `nbpower:cost_<tag>` (**NB Power cost**) | CAD | **Use this as the consumption's cost.** The portal's per-hour dollars (energy charge only, rounded to the cent). |
 
 These are written by the integration rather than recorded from a sensor:
 the portal publishes usage a day or more late, so each refresh rewrites
 the days still being published, and an hour that arrives late still lands
-in its own hour.
+in its own hour. `<tag>` is a short hash of the portal account, so the
+ids stay the same if the integration is removed and added again.
 
 ## Installation
 
@@ -102,13 +103,13 @@ include that line when opening an issue.
 
 1. **Settings → Dashboards → Energy**
 2. Under **Grid consumption**, click **Add consumption**
-3. Select the statistic **NB Power \<account\> energy**
+3. Select the statistic **NB Power energy**
 4. Under cost, choose **Use an entity tracking the total costs** and select
-   **NB Power \<account\> cost**
+   **NB Power cost**
 
 Upgrading from 0.11 or earlier: edit the existing consumption and switch
 it from *NB Power Energy usage* (the sensor) to the statistic above, and
-the cost from *NB Power Cost usage* to *NB Power \<account\> cost*. The
+the cost from *NB Power Cost usage* to *NB Power cost*. The
 statistics carry their own full history, so nothing is lost by switching.
 
 Older periods (more than a year back) are each billing cycle's total
