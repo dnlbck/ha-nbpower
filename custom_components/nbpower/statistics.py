@@ -18,6 +18,9 @@ two phases:
 When the first hourly pass completes, a statistics frontier is pinned:
 the recorder owns every hour from there on, imports never write at or
 after it, and the recorder's own rows are aligned onto the imported chain.
+Usage after the frontier therefore reaches this series only as the
+sensor's steps; the hour-by-hour series for the Energy dashboard is the
+external statistics in external_statistics.py.
 """
 
 from __future__ import annotations
@@ -245,15 +248,22 @@ async def _async_import_cost_history(
 
 
 async def async_backfill_hourly_statistics(
-    hass: HomeAssistant, entry: ConfigEntry, coordinator: NBPowerCoordinator
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: NBPowerCoordinator,
+    *,
+    wait: bool = False,
 ) -> None:
     """Import hourly statistics for published days, resumable and repeatable.
 
     Runs as a background task, so failures are logged here; the next
-    refresh's pass resumes from the persisted progress.
+    refresh's pass resumes from the persisted progress. Both chains — the
+    energy sensor's and the external statistics — run under one lock, so
+    their portal requests never overlap. ``wait`` queues behind a running
+    pass instead of skipping it.
     """
     lock = _import_locks.setdefault(entry.entry_id, asyncio.Lock())
-    if lock.locked():
+    if lock.locked() and not wait:
         _LOGGER.debug("Statistics import already running; skipping")
         return
     async with lock:
@@ -262,6 +272,17 @@ async def async_backfill_hourly_statistics(
         except Exception:  # noqa: BLE001
             _LOGGER.warning(
                 "Hourly statistics import failed; it will retry on the next refresh",
+                exc_info=True,
+            )
+        # Imported here: external_statistics builds on this module.
+        from .external_statistics import async_update_external_statistics
+
+        try:
+            await async_update_external_statistics(hass, entry, coordinator)
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Hourly external statistics update failed; it will retry on the "
+                "next refresh",
                 exc_info=True,
             )
 

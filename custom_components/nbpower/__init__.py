@@ -80,10 +80,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: NBPowerConfigEntry) -> b
     # It always runs — the chain must reach the frontier the energy sensor
     # anchors to — and the backfill option only sets how far back it goes.
     # Starting it now, in the same boot as phase 1, seeds its chain from the
-    # history phase 1 just imported.
+    # history phase 1 just imported. The first refresh's pass may still be
+    # running (on a new entry it ran before the sensor existed, so it could
+    # only start the external statistics): wait for it rather than skip.
     entry.async_create_background_task(
         hass,
-        async_backfill_hourly_statistics(hass, entry, coordinator),
+        async_backfill_hourly_statistics(hass, entry, coordinator, wait=True),
         f"{DOMAIN}_hourly_backfill_{entry.entry_id}",
     )
 

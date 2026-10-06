@@ -20,6 +20,7 @@ from .api import NBPowerClient, UsageRow
 from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    EXTERNAL_GEN,
     MI_SINCE_DAYS,
     MIN_SCAN_INTERVAL,
     REPAIR_GEN,
@@ -93,6 +94,9 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._cost_chain_end: float | None = None
         self._last_cumulative_kwh: float | None = None
         self._last_cumulative_cost: float | None = None
+        # Progress of the hourly external statistics; owned and interpreted
+        # by external_statistics.py.
+        self._external: dict[str, Any] = {}
 
     async def async_load_stored(self) -> None:
         """Load backfill progress and the monotonic-counter floor."""
@@ -108,11 +112,16 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.info("Resetting statistics backfill for repair generation %s", REPAIR_GEN)
             floor_kwh = raw.get("last_cumulative_kwh")
             floor_cost = raw.get("last_cumulative_cost")
+            # The external statistics are a separate chain with their own
+            # generation; a sensor-chain repair must not rebuild them.
+            external = raw.get("external")
             raw = {}
             if floor_kwh is not None:
                 raw["last_cumulative_kwh"] = floor_kwh
             if floor_cost is not None:
                 raw["last_cumulative_cost"] = floor_cost
+            if external:
+                raw["external"] = external
         self.stats_imported = bool(raw.get("stats_imported"))
         through = raw.get("interval_through")
         self._interval_through = date.fromisoformat(through) if through else None
@@ -132,6 +141,22 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._cost_chain_end = raw.get("cost_chain_end")
         self._last_cumulative_kwh = raw.get("last_cumulative_kwh")
         self._last_cumulative_cost = raw.get("last_cumulative_cost")
+        self._external = dict(raw.get("external") or {})
+
+    def external_state(self) -> dict[str, Any]:
+        """Persisted progress of the hourly external statistics (a copy)."""
+        return dict(self._external)
+
+    async def async_store_external_state(self, state: dict[str, Any]) -> None:
+        self._external = dict(state)
+        await self._async_save_stored()
+
+    @property
+    def external_history_pending(self) -> bool:
+        """True until the external statistics' day-resolution part is in."""
+        return self._external.get("gen") != EXTERNAL_GEN or not self._external.get(
+            "through"
+        )
 
     async def mark_stats_imported(self) -> None:
         """Persist that the day-resolution statistics import completed."""
@@ -233,6 +258,7 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "cost_chain_end": self._cost_chain_end,
                 "last_cumulative_kwh": self._last_cumulative_kwh,
                 "last_cumulative_cost": self._last_cumulative_cost,
+                "external": self._external,
             }
         )
 
@@ -457,10 +483,13 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_cumulative_cost = cumulative_cost
             await self._async_save_stored()
 
-        # History feeds the day-resolution import and the hourly chain's
-        # starting seed, so keep it until the hourly chain has started.
+        # History feeds the day-resolution imports and the hourly chain's
+        # starting seed, so keep it until the hourly chain has started and
+        # the external statistics have their day-resolution part.
         if (
-            not self.stats_imported or self._interval_through is None
+            not self.stats_imported
+            or self._interval_through is None
+            or self.external_history_pending
         ) and not self.history_rows:
             self.history_rows = monthly + [
                 row

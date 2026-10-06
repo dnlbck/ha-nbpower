@@ -170,6 +170,25 @@ def _interval_rows(day: date) -> list[dict]:
     return rows
 
 
+def _hourly_rows(day: date) -> list[dict]:
+    """24 hourly rows like Mode=H returns: the MI quarters summed per hour."""
+    totals: dict[int, float] = {}
+    for row in _interval_rows(day):
+        hour = int(row["Hourly"][:2])
+        totals[hour] = totals.get(hour, 0.0) + row["Consumption"]
+    return [
+        {
+            "UsageDate": day.strftime("%B %d, %Y"),
+            "Hourly": f"{hour:02d}:00",
+            "Consumption": round(kwh, 3),
+            "UsageValue": round(kwh, 3),
+            "Amount": round(kwh * 0.1584, 2),
+            "ValidationStatus": "Validated",
+        }
+        for hour, kwh in sorted(totals.items())
+    ]
+
+
 def _parse_strdate(value: str | None) -> date | None:
     if not value:
         return None
@@ -207,17 +226,20 @@ def _usage_payload(mode: str, rtype: str, strdate: str | None, enddate, date_fro
             ]
         data["objUsageGenerationResultSetTwo"] = rows
     elif mode == "H":
-        yesterday = date.today() - timedelta(days=1)
-        data["objUsageGenerationResultSetTwo"] = [
-            {
-                "UsageDate": yesterday.strftime("%B %d, %Y"),
-                "Hourly": f"{h:02d}:00",
-                "Consumption": 0.9 + (h % 5) * 0.1,
-                "UsageValue": 0.9 + (h % 5) * 0.1,
-                "ValidationStatus": "Validated",
-            }
-            for h in range(24)
-        ]
+        # Any day about a year back, like MI. Without a date — and for a
+        # day not published yet — the latest published day comes back.
+        day = _parse_strdate(strdate)
+        today = date.today()
+        if day is None or day >= today:
+            rows = _hourly_rows(today - timedelta(days=1))
+        elif day < today - timedelta(days=365):
+            rows = []
+        else:
+            rows = _hourly_rows(day)
+            if state.get("partial_day") and day == today - timedelta(days=2):
+                # The same out-of-order block publication as MI below.
+                rows = [r for r in rows if not 8 <= int(r["Hourly"][:2]) <= 15]
+        data["objUsageGenerationResultSetTwo"] = rows
     elif mode.upper() == "MI":
         # Single day only; ranges (enddate) are rejected; 'Mi' (lowercase)
         # returns nothing like the real server; ~1 year of history. Today
@@ -411,11 +433,13 @@ def fast_backfill(monkeypatch):
     unless a test raises INTERVAL_RECENT_DAYS: those tests exercise the
     books-based sensor and the day-resolution import on their own.
     """
+    from custom_components.nbpower import external_statistics as nb_ext
     from custom_components.nbpower import statistics as nb_stats
 
-    monkeypatch.setattr(nb_stats, "INTERVAL_BACKFILL_DAYS", 3)
-    monkeypatch.setattr(nb_stats, "INTERVAL_RECENT_DAYS", 0)
-    monkeypatch.setattr(nb_stats, "INTERVAL_REQUEST_PAUSE", 0)
+    for module in (nb_stats, nb_ext):
+        monkeypatch.setattr(module, "INTERVAL_BACKFILL_DAYS", 3)
+        monkeypatch.setattr(module, "INTERVAL_RECENT_DAYS", 0)
+        monkeypatch.setattr(module, "INTERVAL_REQUEST_PAUSE", 0)
 
 
 @pytest.fixture

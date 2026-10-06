@@ -16,8 +16,11 @@ Observed API behavior (2026-09):
 - ``Mode=D`` returns a fixed trailing window (~one billing cycle) of daily
   rows regardless of the requested date range. ``UsageDate`` is real here.
   The last day or two carry ``ValidationStatus='Estimated'``.
-- ``Mode=H`` returns hourly rows for yesterday only (``Hourly`` holds the
-  time of day).
+- ``Mode=H`` returns 24 hourly rows (``Hourly`` holds the time of day) for
+  the day in ``strdate``/``date`` — about a year back — or the latest
+  published day without one. The values are ``MI`` summed per hour. DST
+  days keep the 00:00-23:00 labels: the spring-forward day carries a
+  02:00 row that does not exist locally (2026-10).
 - ``Mode=Mi`` (15-minute) returns no rows for this account.
 - Every response embeds ``getTentativeData``. In it, ``ProjectedBill`` is
   the projected kWh (``ExpectedUsage`` comes back 0) and
@@ -424,6 +427,18 @@ class NBPowerClient:
         an empty set, so rows are filtered to the requested day here.
         """
         payload = await self.get_usage(mode="MI", rtype="K", day=day)
+        return [
+            row for row in parse_usage_rows(payload) if row.start.date() == day
+        ]
+
+    async def get_hourly_usage(self, day: date) -> list[UsageRow]:
+        """Fetch one day of hourly rows (24, with kWh and dollars).
+
+        The same data as :meth:`get_interval_usage` summed per hour, and
+        the same fallback: an unpublished day returns another day's rows,
+        so rows are filtered to the requested day here.
+        """
+        payload = await self.get_usage(mode="H", rtype="K", day=day)
         return [
             row for row in parse_usage_rows(payload) if row.start.date() == day
         ]
