@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from functools import partial
 from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.statistics import statistics_during_period
+from homeassistant.components.recorder.statistics import get_metadata, statistics_during_period
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
@@ -16,10 +17,8 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 import conftest as nb
 from custom_components.nbpower.api import UsageRow
 from custom_components.nbpower.const import DOMAIN
-from custom_components.nbpower.external_statistics import hour_buckets
+from custom_components.nbpower.external_statistics import hour_buckets, statistic_ids
 
-ENERGY_ID = f"{DOMAIN}:energy_{nb.ACCOUNT_NUMBER}"
-COST_ID = f"{DOMAIN}:cost_{nb.ACCOUNT_NUMBER}"
 FLOW_INPUT = {CONF_USERNAME: "user@example.com", CONF_PASSWORD: "s3cret"}
 
 
@@ -98,13 +97,14 @@ async def test_hourly_statistics_follow_the_portal(
     recorder_mock, hass, portal, nbpower_urls, patched_helper_session, enable_custom_integrations
 ):
     entry = await _setup(hass, portal, nbpower_urls)
+    energy_id, cost_id = statistic_ids(entry, entry.runtime_data)
     state = entry.runtime_data.external_state()
     window_start = date.fromisoformat(state["window_start"])
     through = date.fromisoformat(state["through"])
     assert through == date.today() - timedelta(days=1)
 
-    energy = await _rows(hass, ENERGY_ID)
-    cost = await _rows(hass, COST_ID)
+    energy = await _rows(hass, energy_id)
+    cost = await _rows(hass, cost_id)
     # Every hour of the window holds its own usage and cost...
     _assert_hours_match_portal(energy, window_start, through, 0)
     _assert_hours_match_portal(cost, window_start, through, 1)
@@ -123,9 +123,10 @@ async def test_out_of_order_block_lands_in_its_hours(
     portal.app["state"]["partial_day"] = True
     entry = await _setup(hass, portal, nbpower_urls)
     coord = entry.runtime_data
+    energy_id, _ = statistic_ids(entry, coord)
     # The chain stays final through the day before the hole...
     assert coord.external_state()["through"] == (partial - timedelta(days=1)).isoformat()
-    rows = await _rows(hass, ENERGY_ID)
+    rows = await _rows(hass, energy_id)
     hours = sorted(_local(r).hour for r in rows if _local(r).date() == partial)
     assert hours == [*range(8), *range(16, 24)]
     # ...yet yesterday is already in, on top of what was published.
@@ -134,7 +135,7 @@ async def test_out_of_order_block_lands_in_its_hours(
 
     portal.app["state"]["partial_day"] = False
     await _refresh(hass, coord)
-    rows = await _rows(hass, ENERGY_ID)
+    rows = await _rows(hass, energy_id)
     assert coord.external_state()["through"] == (date.today() - timedelta(days=1)).isoformat()
     _assert_hours_match_portal(rows, partial, partial + timedelta(days=1), 0)
     assert min(change for _, change in _changes(rows)) >= 0
@@ -149,17 +150,18 @@ async def test_upgraded_install_starts_the_statistics(
     history (and so the external statistics) on its next refresh."""
     entry = await _setup(hass, portal, nbpower_urls)
     coord = entry.runtime_data
+    energy_id, cost_id = statistic_ids(entry, coord)
     assert coord.stored_stats_frontier() is not None
     await coord.async_store_external_state({})
     coord.history_rows = []
-    get_instance(hass).async_clear_statistics([ENERGY_ID, COST_ID])
+    get_instance(hass).async_clear_statistics([energy_id, cost_id])
     await get_instance(hass).async_block_till_done()
     value = _sensor_value(hass, entry)
 
     await _refresh(hass, coord)
     state = coord.external_state()
     assert state["through"] == (date.today() - timedelta(days=1)).isoformat()
-    rows = await _rows(hass, ENERGY_ID)
+    rows = await _rows(hass, energy_id)
     assert _local(rows[0]).date() < date.fromisoformat(state["window_start"])
     # The sensor is not part of this chain.
     assert _sensor_value(hass, entry) >= value
@@ -169,11 +171,12 @@ async def test_restart_resumes_without_rewriting_history(
     recorder_mock, hass, portal, nbpower_urls, patched_helper_session, enable_custom_integrations
 ):
     entry = await _setup(hass, portal, nbpower_urls)
-    before = await _rows(hass, ENERGY_ID)
+    energy_id, _ = statistic_ids(entry, entry.runtime_data)
+    before = await _rows(hass, energy_id)
     assert await hass.config_entries.async_reload(entry.entry_id)
     await hass.async_block_till_done(wait_background_tasks=True)
     await _refresh(hass, entry.runtime_data)
-    after = await _rows(hass, ENERGY_ID)
+    after = await _rows(hass, energy_id)
     assert [(r["start"], r["sum"]) for r in after] == pytest.approx(
         [(r["start"], r["sum"]) for r in before]
     )
@@ -203,3 +206,18 @@ def test_hour_buckets_keep_dst_day_totals(day, buckets, doubled_hour):
     if doubled_hour is not None:
         merged = [kwh for start, kwh, _ in result if start.hour == doubled_hour]
         assert merged == [pytest.approx(2.0)]
+
+
+async def test_statistic_ids_keep_the_account_id_out_of_view(
+    recorder_mock, hass, portal, nbpower_urls, patched_helper_session, enable_custom_integrations
+):
+    entry = await _setup(hass, portal, nbpower_urls)
+    ids = statistic_ids(entry, entry.runtime_data)
+    assert all(nb.ACCOUNT_NUMBER not in statistic_id for statistic_id in ids)
+    meta = await get_instance(hass).async_add_executor_job(
+        partial(get_metadata, hass, statistic_ids=set(ids))
+    )
+    assert sorted(m["name"] for _, m in meta.values()) == ["NB Power cost", "NB Power energy"]
+    # The same account maps to the same ids, so a re-added entry continues them.
+    again = MockConfigEntry(domain=DOMAIN, unique_id=f"account_{nb.ACCOUNT_NUMBER}")
+    assert statistic_ids(again, entry.runtime_data) == ids

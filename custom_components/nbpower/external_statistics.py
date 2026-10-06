@@ -4,7 +4,7 @@ The portal publishes usage a day or more after it happens. The energy
 sensor's own statistics belong to the recorder from the statistics
 frontier on, so there late usage can only appear as a step at the poll
 that picks it up, never in the hour it was used. These two external
-statistics, ``nbpower:energy_<account>`` and ``nbpower:cost_<account>``,
+statistics, ``nbpower:energy_<tag>`` and ``nbpower:cost_<tag>``,
 are written by the integration alone, so every hour carries its own usage
 once the portal publishes it:
 
@@ -20,8 +20,8 @@ once the portal publishes it:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
-import re
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -60,23 +60,34 @@ from .statistics import daily_points
 _LOGGER = logging.getLogger(__name__)
 
 
-def account_key(entry: ConfigEntry, coordinator: NBPowerCoordinator) -> str:
-    """The account number as a statistic object id fragment."""
-    raw = (entry.unique_id or "").removeprefix("account_") or str(
+def statistic_ids(
+    entry: ConfigEntry, coordinator: NBPowerCoordinator
+) -> tuple[str, str] | None:
+    """The (energy, cost) statistic ids for the entry's portal account.
+
+    Keyed by a short hash of the portal's internal account id: stable
+    across removing and re-adding the integration, while keeping the id
+    itself out of statistic ids, which end up in screenshots and bug
+    reports. (It is not a secret; the hash only keeps it out of view.)
+    """
+    account = (entry.unique_id or "").removeprefix("account_") or str(
         coordinator.client.account_number or ""
     )
-    return re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+    if not account:
+        return None
+    tag = hashlib.sha256(f"{DOMAIN}:{account}".encode()).hexdigest()[:8]
+    return f"{DOMAIN}:energy_{tag}", f"{DOMAIN}:cost_{tag}"
 
 
 def _metadata(
-    account: str, key: str, unit: str, unit_class: str | None
+    statistic_id: str, name: str, unit: str, unit_class: str | None
 ) -> StatisticMetaData:
     return StatisticMetaData(
         mean_type=StatisticMeanType.NONE,
         has_sum=True,
-        name=f"NB Power {account} {key}",
+        name=name,
         source=DOMAIN,
-        statistic_id=f"{DOMAIN}:{key}_{account}",
+        statistic_id=statistic_id,
         unit_class=unit_class,
         unit_of_measurement=unit,
     )
@@ -129,10 +140,12 @@ async def async_update_external_statistics(
     """
     if "recorder" not in hass.config.components:
         return
-    if not (account := account_key(entry, coordinator)):
+    if not (ids := statistic_ids(entry, coordinator)):
         return
-    energy_meta = _metadata(account, "energy", UnitOfEnergy.KILO_WATT_HOUR, "energy")
-    cost_meta = _metadata(account, "cost", CURRENCY, None)
+    energy_meta = _metadata(
+        ids[0], "NB Power energy", UnitOfEnergy.KILO_WATT_HOUR, "energy"
+    )
+    cost_meta = _metadata(ids[1], "NB Power cost", CURRENCY, None)
     today = dt_util.now().date()
 
     state = coordinator.external_state()
