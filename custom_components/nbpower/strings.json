@@ -18,7 +18,9 @@
     },
     "error": {
       "cannot_connect": "Failed to connect to NB Power. Check your network and try again.",
-      "invalid_auth": "Invalid credentials, or NB Power blocked the login (sign in to the website once in a browser, then try again)."
+      "invalid_auth": "Invalid credentials, or NB Power blocked the login (sign in to the website once in a browser, then try again).",
+      "portal_error": "NB Power's portal returned an unexpected response during sign-in. The Home Assistant log has the details (search for nbpower).",
+      "unknown": "Unexpected error during sign-in. The Home Assistant log has the details (search for nbpower)."
     },
     "abort": {
       "already_configured": "This NB Power account is already configured.",

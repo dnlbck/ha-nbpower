@@ -11,6 +11,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
+from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
@@ -20,6 +21,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 import conftest as nb
 from custom_components.nbpower import config_flow
 from custom_components.nbpower import statistics as nb_stats
+from custom_components.nbpower.api import NBPowerClient
 from custom_components.nbpower.const import DOMAIN
 
 FLOW_INPUT = {CONF_USERNAME: "user@example.com", CONF_PASSWORD: "s3cret"}
@@ -245,7 +247,8 @@ async def test_backfill_option_off_imports_recent_window_only(
 
 @pytest.fixture
 async def faulty_portal(socket_enabled):
-    """The mock portal with switchable faults (login outage, rejected usage)."""
+    """The mock portal with switchable faults (login outage, rejected usage,
+    a replacement account summary page)."""
     app = nb.build_app()
 
     @web.middleware
@@ -253,6 +256,8 @@ async def faulty_portal(socket_enabled):
         state = app["state"]
         if state.get("login_503") and request.method == "POST" and "weblogin" in request.path:
             return web.Response(status=503, text="Service Unavailable")
+        if (page := state.get("account_page")) and request.path.endswith("AccountSummaryView.aspx"):
+            return web.Response(text=page, content_type="text/html")
         if state.get("reject_usage") and request.path.endswith("GetUsageGeneration"):
             return web.json_response(
                 {"result": {"Status": 0, "Message": "Token has been expired.", "Data": None}}
@@ -392,3 +397,72 @@ async def test_last_daily_energy_skips_blank_row(
     newest = [r for r in _blank_newest() if r["Consumption"] != ""][-1]
     state = hass.states.get(_eid(hass, entry, "last_daily_energy"))
     assert float(state.state) == pytest.approx(newest["Consumption"])
+
+
+async def _user_flow(hass, user_input=FLOW_INPUT):
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+    return await hass.config_entries.flow.async_configure(result["flow_id"], user_input)
+
+
+async def test_config_flow_missing_widget_token_is_a_portal_error(
+    hass, faulty_portal, nbpower_urls, patched_helper_session,
+    enable_custom_integrations, caplog,
+):
+    """Issue #1: a sign-in that lands on a page without the usage graph
+    was reported as a network failure, with nothing in the log."""
+    nbpower_urls(nb.server_base(faulty_portal))
+    faulty_portal.app["state"]["account_page"] = nb.DEFAULT_FORM.format(
+        action="/Customer/SelectAccount.aspx", extra=""
+    ).replace("<html>", "<html><head><title>Select an Account</title></head>")
+    result = await _user_flow(hass)
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "portal_error"}
+    assert "No widget token on the account page" in caplog.text
+    assert "'/Customer/AccountSummaryView.aspx'" in caplog.text
+    assert "'Select an Account'" in caplog.text
+    assert FLOW_INPUT[CONF_PASSWORD] not in caplog.text
+
+
+async def test_config_flow_finds_a_relocated_widget_token(
+    hass, faulty_portal, nbpower_urls, patched_helper_session,
+    enable_custom_integrations,
+):
+    """The token field's control path follows the page layout."""
+    nbpower_urls(nb.server_base(faulty_portal))
+    faulty_portal.app["state"]["account_page"] = nb.DEFAULT_FORM.format(
+        action="/Customer/AccountSummaryView.aspx",
+        extra=(
+            '<input type="hidden" name="ctl00$contentPlaceHolder$ucUsageGraph$'
+            f'accountSEWToken" value="{nb.WIDGET_TOKEN}"/>'
+        ),
+    )
+    result = await _user_flow(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+
+
+async def test_config_flow_unreachable_portal_is_cannot_connect(
+    hass, socket_enabled, nbpower_urls, patched_helper_session,
+    enable_custom_integrations, caplog,
+):
+    closed = TestServer(web.Application())
+    await closed.start_server()
+    base = nb.server_base(closed)
+    await closed.close()
+    nbpower_urls(base)
+    result = await _user_flow(hass)
+    assert result["errors"] == {"base": "cannot_connect"}
+    assert "Could not reach NB Power while signing in" in caplog.text
+
+
+async def test_config_flow_unexpected_error_is_unknown(
+    hass, nbpower_urls, patched_helper_session, enable_custom_integrations,
+    monkeypatch, caplog,
+):
+    async def _boom(self, username, password, *, validate=True):
+        raise KeyError("ctl00")
+
+    monkeypatch.setattr(NBPowerClient, "bootstrap", _boom)
+    result = await _user_flow(hass)
+    assert result["errors"] == {"base": "unknown"}
+    assert "Unexpected error while signing in to NB Power" in caplog.text

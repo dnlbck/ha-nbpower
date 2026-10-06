@@ -41,7 +41,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -55,6 +55,7 @@ VALID_TYPES = {"K", "D"}  # K = kWh/kW, D = dollars
 
 _ASPNET_JSON_DATE_RE = re.compile(r"^/Date\((\d+)(?:[+-]\d+)?\)/$")
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})")
+_SEW_TOKEN_NAME_RE = re.compile(r"SEWToken$", re.IGNORECASE)
 
 _DATE_FORMATS = (
     "%Y-%m-%dT%H:%M:%S",
@@ -293,8 +294,6 @@ class NBPowerClient:
         await self._prime_session()
         await self._login(username, password)
         token = await self._account_token()
-        if not token:
-            raise NBPowerApiError("Could not find a widget token on the account page")
         # The page-scraped token type is accepted by VerifyToken, which is
         # what resolves the account identifiers in the login flow.
         data = await self._verify_token(token)
@@ -558,7 +557,7 @@ class NBPowerClient:
         if "weblogin.aspx" in final_url.lower() or "Cookies required" in html2:
             raise NBPowerAuthError("Invalid credentials or blocked login")
 
-    async def _account_token(self) -> str | None:
+    async def _account_token(self) -> str:
         """Scrape the SEW widget token from the account summary page."""
         html, final_url = await self._get_html("/Customer/AccountSummaryView.aspx")
         if "weblogin.aspx" in final_url.lower():
@@ -568,17 +567,20 @@ class NBPowerClient:
         token = fields.get("ctl00$contentPlaceHolder$ucConsumptionGraph$accountSEWToken")
         if token:
             return token
-        # Fallback: ask the WidgetAPI directly.
-        body = await self._widget_post_json(
-            "/Token/GetToken",
-            {"Utility": "NBPower"},
-            referer=final_url,
-            authenticated=False,
+        # The control path in the field name follows the page layout; the
+        # name's tail is the stable part.
+        for el in soup.find_all("input", attrs={"name": _SEW_TOKEN_NAME_RE}):
+            if token := el.get("value"):
+                return token
+        # The WidgetAPI's /Token/GetToken (the reference project's fallback)
+        # answers HTTP 404 since at least 2026-10, so there is nothing else
+        # to try. Name the page the login landed on: an account picker or
+        # an interstitial notice are the likely reasons for a missing graph.
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        raise NBPowerApiError(
+            "No widget token on the account page (landed on "
+            f"{urlsplit(final_url).path!r}, title {title!r})"
         )
-        result = body.get("result") if isinstance(body, dict) else None
-        if isinstance(result, dict):
-            return result.get("Token")
-        return None
 
     async def _verify_token(self, token: str) -> dict[str, Any]:
         body = await self._widget_post(

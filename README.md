@@ -83,7 +83,10 @@ your Home Assistant configuration and restart.
 
 If login fails with *invalid credentials*, sign in to www.nbpower.com once
 in a normal browser and try again (NB Power occasionally challenges logins;
-a recent browser session satisfies it).
+a recent browser session satisfies it). If it fails with *an unexpected
+response*, the Home Assistant log names the sign-in step that failed and
+the page the login landed on (search the log for `nbpower`) — please
+include that line when opening an issue.
 
 ### Adding to the Energy dashboard
 

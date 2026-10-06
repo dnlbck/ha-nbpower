@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import aiohttp
@@ -32,6 +33,8 @@ from .const import (
 )
 from .exceptions import NBPowerAuthError, NBPowerError
 
+_LOGGER = logging.getLogger(__name__)
+
 STEP_USER_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USERNAME): str,
@@ -44,8 +47,10 @@ async def _validate_login(hass: HomeAssistant, username: str, password: str) -> 
     """Log in to the portal end-to-end; return the account number.
 
     Runs the full bootstrap: ASP.NET login, widget-token scrape, account
-    resolution and a usage-request validation. Raises
-    ValueError("invalid_auth"|"cannot_connect") on failure.
+    resolution and a usage-request validation. Raises ValueError with the
+    form error key ("invalid_auth", "cannot_connect", "portal_error" or
+    "unknown") on failure; the cause is logged, as the form can only show
+    the key.
     """
     # Its own cookie jar, so this login cannot replace the portal session of
     # an entry that is already running.
@@ -57,9 +62,23 @@ async def _validate_login(hass: HomeAssistant, username: str, password: str) -> 
     try:
         await client.bootstrap(username, password)
     except NBPowerAuthError as err:
+        _LOGGER.debug("NB Power rejected the sign-in: %s", err)
         raise ValueError("invalid_auth") from err
-    except (NBPowerError, TimeoutError, aiohttp.ClientError) as err:
+    except (TimeoutError, aiohttp.ClientError) as err:
+        _LOGGER.warning(
+            "Could not reach NB Power while signing in: %s: %s",
+            type(err).__name__,
+            err,
+        )
         raise ValueError("cannot_connect") from err
+    except NBPowerError as err:
+        # Reached the portal, but a step of the sign-in came back in a shape
+        # the client does not handle (site change, account-specific page).
+        _LOGGER.warning("NB Power sign-in failed: %s", err)
+        raise ValueError("portal_error") from err
+    except Exception as err:
+        _LOGGER.exception("Unexpected error while signing in to NB Power")
+        raise ValueError("unknown") from err
     return str(client.account_number)
 
 
