@@ -82,7 +82,7 @@ async def _setup_entry(
     )
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     return entry
 
 
@@ -222,7 +222,7 @@ async def test_config_flow_success(
         result["flow_id"],
         FLOW_INPUT,
     )
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert result["title"] == ACCOUNT_TITLE
     assert len(hass.config_entries.async_entries(DOMAIN)) == 1
@@ -269,7 +269,7 @@ async def test_reauth_with_credentials_recovers_entry(
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], FLOW_INPUT
     )
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert result["type"] == FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
     assert entry.data[CONF_PASSWORD] == PASSWORD
@@ -402,6 +402,7 @@ async def test_hourly_backfill_upgrades_resolution(
 async def test_repair_generation_reimports_consistently(
     recorder_mock,
     hass,
+    hass_storage,
     portal,
     nbpower_urls,
     patched_helper_session,
@@ -414,9 +415,6 @@ async def test_repair_generation_reimports_consistently(
     its state chain from zero instead of continuing the day-resolution
     series.
     """
-    import json
-    import os
-
     from homeassistant.components.recorder import get_instance
     from homeassistant.components.recorder.statistics import statistics_during_period
     from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
@@ -430,11 +428,12 @@ async def test_repair_generation_reimports_consistently(
     )
     entry.add_to_hass(hass)
 
-    # Simulate the pre-repair storage record.
-    storage_path = hass.config.path("storage", f"nbpower.{entry.entry_id}")
-    os.makedirs(os.path.dirname(storage_path), exist_ok=True)
-    with open(storage_path, "w", encoding="utf-8") as fh:
-        json.dump({"version": 1, "data": {"stats_imported": True}}, fh)
+    # Simulate the pre-repair storage record. Tests run on mock storage, so
+    # it must go through hass_storage — a file on disk is never read.
+    hass_storage[f"nbpower.{entry.entry_id}"] = {
+        "version": 1,
+        "data": {"stats_imported": True},
+    }
 
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done(wait_background_tasks=True)
@@ -454,6 +453,11 @@ async def test_repair_generation_reimports_consistently(
     rows = sorted(stats[statistic_id], key=lambda r: r["start"])
     states_series = [r["state"] for r in rows if r["state"] is not None]
     assert states_series == sorted(states_series), "state series decreased"
+
+    # The stale stats_imported flag was discarded: the cycle history
+    # (~3 years) was re-imported rather than skipped.
+    first_day = dt_util.as_local(dt_util.utc_from_timestamp(rows[0]["start"])).date()
+    assert (date.today() - first_day).days > 700
 
     # Hourly rows continue the day-resolution chain: the earliest hourly
     # state must be a large value (the pre-window cumulative), not ~0.

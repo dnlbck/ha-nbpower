@@ -278,12 +278,16 @@ class NBPowerClient:
     # Public data access
     # ------------------------------------------------------------------
 
-    async def bootstrap(self, username: str, password: str) -> None:
+    async def bootstrap(
+        self, username: str, password: str, *, validate: bool = True
+    ) -> None:
         """Log in with portal credentials and resolve identifiers.
 
         The MyAccount login is the most fragile part of the flow (ASP.NET
-        postback, potential CAPTCHA), so the integration defaults to
-        :meth:`bootstrap_with_token` with a token captured from the browser.
+        postback, a BotDetect field that would fail as an auth error if NB
+        Power ever enforced the CAPTCHA). ``validate=False`` skips the
+        confirming usage request, for callers whose next request exercises
+        the token anyway.
         """
         self.invalidate()
         await self._prime_session()
@@ -298,6 +302,7 @@ class NBPowerClient:
             token,
             account_number=data.get("AccountNumber"),
             utility_account_number=data.get("UtilityAccountNumber"),
+            validate=validate,
         )
 
     async def bootstrap_with_token(
@@ -306,6 +311,7 @@ class NBPowerClient:
         *,
         account_number: str | int | None = None,
         utility_account_number: str | int | None = None,
+        validate: bool = True,
     ) -> None:
         """Adopt a browser-captured widget token and validate it.
 
@@ -329,8 +335,9 @@ class NBPowerClient:
                 "Account number and utility account number are required "
                 "alongside the token"
             )
-        # Validate: a minimal daily-mode request must come back Status=1.
-        await self.get_usage(mode="D", rtype="K")
+        if validate:
+            # A minimal daily-mode request must come back Status=1.
+            await self.get_usage(mode="D", rtype="K")
 
     async def get_usage(
         self,
@@ -544,7 +551,10 @@ class NBPowerClient:
         post_url = urljoin(login_url, action or path)
         html2, final_url, status = await self._post_form(post_url, data, login_url)
         if status not in (200, 302):
-            raise NBPowerAuthError(f"Login POST returned HTTP {status}")
+            # A server error (e.g. 503 during portal maintenance) says
+            # nothing about the credentials; an auth error here would stop
+            # polling until the user re-entered their password.
+            raise NBPowerApiError(f"Login POST returned HTTP {status}")
         if "weblogin.aspx" in final_url.lower() or "Cookies required" in html2:
             raise NBPowerAuthError("Invalid credentials or blocked login")
 

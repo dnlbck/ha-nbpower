@@ -23,8 +23,9 @@ against live traffic.
 - Username/password sign-in with automatic session renewal (tokens expire
   within hours; the integration just logs in again)
 - **Energy dashboard ready**: a cumulative `total_increasing` kWh sensor for
-  grid consumption, derived from the portal's own books (billing-cycle
-  totals plus the current cycle's daily readings)
+  grid consumption, advanced by the portal's 15-minute interval feed (so
+  billing-cycle postings, which restructure the portal's books by hundreds
+  of kWh, never show up as phantom usage), plus a cumulative CAD cost sensor
 - **~3 years of history backfill**: on first setup, all published billing
   cycles (~36 months) are imported as long-term statistics — each cycle's
   kWh spread evenly across its days — plus the trailing daily window at
@@ -36,13 +37,17 @@ against live traffic.
 - Month-to-date usage and cost, projected usage and bill
 - CAD monetary sensors, daily usage attributes
 
-Only two API calls are made per refresh (monthly + daily).
+A refresh makes the monthly and daily requests plus one 15-minute request
+per day still being published (usually 1–3); fully published days are
+settled and not fetched again. When the portal session has expired, the
+sign-in adds a handful of requests.
 
 ## Entities
 
 | Entity | Class | Description |
 |---|---|---|
-| `sensor.nb_power_energy_usage` | energy (kWh, total increasing) | **Use this one in the Energy dashboard.** Cumulative counter derived from billing cycles + daily readings. |
+| `sensor.nb_power_energy_usage` | energy (kWh, total increasing) | **Use this one in the Energy dashboard.** Cumulative counter: the imported history, advanced by the 15-minute interval feed. |
+| `sensor.nb_power_cost_usage` | monetary (CAD, total) | Cumulative energy cost from the portal's books; usable as the consumption's cost entity |
 | `sensor.nb_power_last_daily_energy` | energy (kWh) | Most recent daily total in the portal's window |
 | `sensor.nb_power_month_to_date_energy` | energy (kWh) | Month-to-date usage |
 | `sensor.nb_power_month_to_date_cost` | monetary (CAD) | Month-to-date cost |
@@ -53,6 +58,8 @@ The energy usage sensor also exposes `account_number`, `meter_number`,
 `last_daily_date`, and `daily_kwh` (the trailing window) as attributes.
 
 ## Installation
+
+Requires Home Assistant 2025.11 or newer.
 
 ### HACS
 
@@ -107,7 +114,10 @@ weeks use the portal's real daily readings.
 
 The polling interval (1–24 hours, default 4) and the hourly-resolution
 backfill (on by default) can be changed via **Configure** on the
-integration entry.
+integration entry. With the backfill off, only the last 10 days are
+imported at hourly resolution (enough to bridge the portal's publication
+lag); older history stays at daily resolution. The option applies to new
+imports — history already upgraded stays as it is.
 
 ## Verifying the API before installing
 

@@ -8,21 +8,25 @@ two phases:
 1. **Immediate (day resolution)**: all monthly billing cycles (~3 years,
    each cycle's kWh spread evenly across its days) plus the trailing daily
    window, imported during setup.
-2. **Background (hour resolution)**: the last ~365 days are re-fetched as
-   15-minute intervals and imported as hourly rows. Because
+2. **Background (hour resolution)**: the last ~365 days (only the last
+   ``INTERVAL_RECENT_DAYS`` with the backfill option off) are re-fetched
+   as 15-minute intervals and imported as hourly rows. Because
    ``async_import_statistics`` updates same-period rows in place, each
    day-row at midnight is replaced by that day's 24 hourly rows — no
    double-counting, and the process is resumable across restarts.
 
-Imported periods always end before the entity's first native statistic
-(setup moment), so imports never collide with recorder-generated rows.
+When the first hourly pass completes, a statistics frontier is pinned:
+the recorder owns every hour from there on, imports never write at or
+after it, and the recorder's own rows are aligned onto the imported chain.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
+
+import aiohttp
 
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -38,17 +42,26 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .api import UsageRow
-from .const import DOMAIN, INTERVAL_BACKFILL_DAYS, INTERVAL_REQUEST_PAUSE, MI_SINCE_DAYS
+from .const import (
+    CONF_BACKFILL_HOURLY,
+    DOMAIN,
+    INTERVAL_BACKFILL_DAYS,
+    INTERVAL_RECENT_DAYS,
+    INTERVAL_REQUEST_PAUSE,
+    MI_SINCE_DAYS,
+)
 from .coordinator import NBPowerCoordinator
 from .exceptions import NBPowerError
 from .sensor import COST_KEY, ENERGY_KEY, UNIQUE_ID_TEMPLATE
 
 _LOGGER = logging.getLogger(__name__)
 
-# Only one statistics import may run at a time: the setup backfill and the
-# per-refresh extension both drive the same chain, and interleaved runs
-# corrupt the cumulative sums (observed live as a mixed-baseline series).
-_import_lock = asyncio.Lock()
+# Only one statistics import may run per entry at a time: the setup
+# backfill and the per-refresh extension both drive the same chain, and
+# interleaved runs corrupt the cumulative sums (observed live as a
+# mixed-baseline series). Keyed by entry so separate accounts don't skip
+# each other's imports, while a reloaded entry still waits on its old run.
+_import_locks: dict[str, asyncio.Lock] = {}
 
 
 def daily_points(
@@ -177,7 +190,27 @@ async def async_import_history_statistics(
         _LOGGER.info(
             "Imported %s day-resolution statistics for %s", len(points), statistic_id
         )
+    # Energy is queued; never re-run it. A retry after the hourly upgrade
+    # has started would put day rows back over its midnight hours and
+    # break the chain.
+    await coordinator.mark_stats_imported()
+    try:
+        await _async_import_cost_history(hass, entry, coordinator, history, today)
+    except Exception:  # noqa: BLE001
+        _LOGGER.warning(
+            "Cost history import failed; cost statistics start at setup",
+            exc_info=True,
+        )
 
+
+async def _async_import_cost_history(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: NBPowerCoordinator,
+    history: list[UsageRow],
+    today: date,
+) -> None:
+    """Import cost history at day resolution and align its native block."""
     # Cost history: cycles and daily rows carry dollar amounts. The chain
     # ends at the books' own cumulative through the last imported day;
     # persist it so later alignment passes anchor there (not at the
@@ -209,18 +242,28 @@ async def async_import_history_statistics(
                 cost_stats[-1]["start"],
                 round(cost_chain_end, 2),
             )
-    await coordinator.mark_stats_imported()
 
 
 async def async_backfill_hourly_statistics(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: NBPowerCoordinator
 ) -> None:
-    """Import hourly statistics for published days, resumable and repeatable."""
-    if _import_lock.locked():
+    """Import hourly statistics for published days, resumable and repeatable.
+
+    Runs as a background task, so failures are logged here; the next
+    refresh's pass resumes from the persisted progress.
+    """
+    lock = _import_locks.setdefault(entry.entry_id, asyncio.Lock())
+    if lock.locked():
         _LOGGER.debug("Statistics import already running; skipping")
         return
-    async with _import_lock:
-        await _async_import_hourly(hass, entry, coordinator)
+    async with lock:
+        try:
+            await _async_import_hourly(hass, entry, coordinator)
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Hourly statistics import failed; it will retry on the next refresh",
+                exc_info=True,
+            )
 
 
 async def _async_import_hourly(
@@ -231,9 +274,16 @@ async def _async_import_hourly(
         return
     client = coordinator.client
     today = dt_util.now().date()
-    start_day = today - timedelta(days=INTERVAL_BACKFILL_DAYS)
+    window = (
+        INTERVAL_BACKFILL_DAYS
+        if entry.options.get(CONF_BACKFILL_HOURLY, True)
+        else INTERVAL_RECENT_DAYS
+    )
+    start_day = today - timedelta(days=window)
     through = coordinator.stored_interval_through()
-    resume_from = max(start_day, through + timedelta(days=1)) if through else start_day
+    # Resume exactly where the chain left off: jumping ahead to a newer
+    # window start would skip days the stored seed does not include.
+    resume_from = through + timedelta(days=1) if through else start_day
     # The recorder owns everything from the frontier onward; the import
     # never writes those hours (rewrites there get reverted and create
     # negative seams). On first completion the frontier is pinned to now.
@@ -245,15 +295,17 @@ async def _async_import_hourly(
 
     # Seed the hourly state series where the day-resolution series left
     # off: everything phase 1 recorded strictly before the first hour row.
+    # A stored seed is only meaningful with its ``through`` (the two are
+    # persisted together); until the first day completes, derive it for
+    # this run's own starting day.
     seed = coordinator.stored_interval_state_seed()
-    if seed is None:
+    if seed is None or through is None:
         seed = 0.0
         if coordinator.history_rows:
             prior = [
                 p for p in daily_points(coordinator.history_rows, today) if p[0] < resume_from
             ]
             seed = round(sum(kwh for _, kwh in prior), 3)
-        await coordinator.store_interval_state_seed(seed)
 
     imported = 0
     day = resume_from
@@ -267,7 +319,7 @@ async def _async_import_hourly(
             break
         try:
             rows = await client.get_interval_usage(day)
-        except (NBPowerError, TimeoutError, OSError) as err:
+        except (NBPowerError, TimeoutError, aiohttp.ClientError, OSError) as err:
             _LOGGER.warning(
                 "Hourly statistics import stopped at %s (%s); it will retry "
                 "on the next refresh",
@@ -307,20 +359,32 @@ async def _async_import_hourly(
                 imported += len(points)
 
             if frontier_day:
-                # Complete once publication has caught up PAST the frontier
-                # (the frontier can sit mid-hour, so the last full
-                # import-owned hour ends before it).
-                complete = any(
+                # Complete once every import-owned hour is in AND publication
+                # has caught up past the frontier. The feed publishes in
+                # blocks, not always in order (live: 00-07 and 16-23 present
+                # while 08-15 were still missing), so data after the frontier
+                # alone does not prove the owned hours are published.
+                present = {when for when, _kwh in raw_points}
+                owned = (datetime.combine(day, time(hour)) for hour in range(24))
+                complete = all(
+                    hour in present
+                    for hour in owned
+                    if dt_util.as_local(hour) + timedelta(hours=1) <= frontier
+                ) and any(
                     dt_util.as_local(when) + timedelta(hours=1) > frontier
-                    for when, _kwh in raw_points
+                    for when in present
                 )
             else:
                 complete = len(points) >= 24
+            if not complete and (today - day).days > MI_SINCE_DAYS:
+                # Still partial long after publication: a permanent gap
+                # (meter outage). Keep what was published and move on rather
+                # than stalling the import — and the frontier — on this day.
+                complete = True
             if complete:
-                # Complete day: advance the persisted chain; the next run
-                # continues from here.
+                # Complete day: advance the chain; the next run continues
+                # from here.
                 seed += sum(kwh for _, kwh in points)
-                await coordinator.store_interval_state_seed(round(seed, 3))
             else:
                 # The portal publishes days partially. This is the feed's
                 # frontier: keep the persisted chain at the last complete
@@ -342,7 +406,7 @@ async def _async_import_hourly(
             _LOGGER.info("Day %s not published yet; will retry", day)
             break
 
-        await coordinator.store_interval_through(day)
+        await coordinator.store_interval_progress(day, seed)
         day += timedelta(days=1)
         await asyncio.sleep(INTERVAL_REQUEST_PAUSE)
 
@@ -354,7 +418,15 @@ async def _async_import_hourly(
             seed,
         )
     if frontier is None and coordinator.stored_interval_through() is not None:
-        await coordinator.store_stats_frontier(dt_util.now(), seed)
+        # Anchor the sensor at the value the recorder last saw, not at the
+        # chain end: the recorder books every sensor step as consumption,
+        # and the gap between the two (days the books had not caught up on)
+        # is already in the imported chain. The sensor trails the chain by
+        # that gap, as it does for below-frontier imports.
+        published = coordinator.published_kwh()
+        await coordinator.store_stats_frontier(
+            dt_util.now(), published if published is not None else seed
+        )
         _LOGGER.info("Statistics frontier pinned; recorder owns hours from here")
     # Align the recorder-owned blocks after the chain onto the chain ends
     # (a no-op once aligned; re-anchors the native block if it drifts —
@@ -403,7 +475,7 @@ async def _async_derive_cost_chain_end(
     from homeassistant.components.recorder.statistics import get_last_statistics
 
     result = await get_instance(hass).async_add_executor_job(
-        get_last_statistics, hass, 72, statistic_id, True, {"sum"}
+        get_last_statistics, hass, 72, statistic_id, False, {"sum"}
     )
     rows = sorted(
         (result.get(statistic_id) or []), key=lambda r: _row_ts(r["start"])
@@ -430,9 +502,10 @@ async def _async_align_native_block(
     """Shift native recorder rows after the imported chain onto ``chain_end``.
 
     The recorder owns recent hours (its short-term data wins over row
-    rewrites), so alignment goes through the recorder's own
-    ``adjust_statistics`` — it updates long- AND short-term rows, keeping
-    future recompiles consistent. Without this, the first native row after
+    rewrites), so alignment goes through the recorder's own adjust job —
+    queued on the recorder thread, so it serializes with the recorder's
+    compiles — which updates long- AND short-term rows, keeping future
+    recompiles consistent. Without this, the first native row after
     the imported chain sits at the books-fed sensor level, below the
     interval-fed chain, rendering as a negative bar at the seam.
 
@@ -444,13 +517,12 @@ async def _async_align_native_block(
     """
     if after is None:
         return
-    from homeassistant.components.recorder.statistics import (
-        adjust_statistics,
-        get_last_statistics,
-    )
+    from homeassistant.components.recorder.statistics import get_last_statistics
 
+    # Raw statistic units: converted reads follow the entity's display unit
+    # (e.g. MWh), which would be compared against a kWh chain end.
     result = await get_instance(hass).async_add_executor_job(
-        get_last_statistics, hass, 72, statistic_id, True, {"sum"}
+        get_last_statistics, hass, 72, statistic_id, False, {"sum"}
     )
     all_rows = sorted(
         (result.get(statistic_id) or []), key=lambda r: _row_ts(r["start"])
@@ -474,13 +546,8 @@ async def _async_align_native_block(
         row_sum = round(row.get("sum") or 0.0, 3)
         deficit = round(level - row_sum, 3)
         if deficit > 0.01:
-            await get_instance(hass).async_add_executor_job(
-                adjust_statistics,
-                get_instance(hass),
-                statistic_id,
-                _row_dt(row["start"]),
-                deficit,
-                "kWh",
+            get_instance(hass).async_adjust_statistics(
+                statistic_id, _row_dt(row["start"]), deficit, "kWh"
             )
             _LOGGER.info(
                 "Repaired native statistics dip for %s at %s (+%.3f)",

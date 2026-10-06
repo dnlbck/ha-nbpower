@@ -36,18 +36,23 @@ ATTR_DAILY_KWH = "daily_kwh"
 class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinate NB Power portal data and the cumulative energy counter.
 
-    The counter is derived on every refresh from the portal's own books:
+    The portal's books feed the cost and month-to-date sensors:
 
     * ``Mode=M`` returns ~36 completed billing cycles with kWh totals —
-      the deep history, and the anchor of the counter.
+      the deep history.
     * ``Mode=D`` returns the trailing daily window (about one billing
       cycle, including the current cycle to date).
 
     Summing the monthly cycles plus the daily rows that fall after the last
-    cycle's end date gives a consistent cumulative total with no persisted
-    state, immune to meter re-validations inside completed cycles. (The
-    window and cycles overlap on the last cycle's end date, which is why
-    only strictly-later daily rows are added.)
+    cycle's end date gives the books' cumulative total. (The window and
+    cycles overlap on the last cycle's end date, which is why only
+    strictly-later daily rows are added.)
+
+    The energy counter uses the books only until the statistics frontier
+    is pinned. From then on it runs on one ledger — the 15-minute interval
+    feed, anchored at the value published when the frontier was pinned —
+    because posting a billing cycle restructures the books by hundreds of
+    kWh that the imported chain already counts.
     """
 
     def __init__(
@@ -83,6 +88,8 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._interval_state_seed: float | None = None
         self._stats_frontier: datetime | None = None
         self._frontier_end: float | None = None
+        self._sensor_anchor_at: datetime | None = None
+        self._sensor_anchor_kwh: float | None = None
         self._cost_chain_end: float | None = None
         self._last_cumulative_kwh: float | None = None
         self._last_cumulative_cost: float | None = None
@@ -116,6 +123,12 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else None
         )
         self._frontier_end = raw.get("frontier_end")
+        self._sensor_anchor_at = (
+            datetime.fromisoformat(raw["sensor_anchor_at"])
+            if raw.get("sensor_anchor_at")
+            else None
+        )
+        self._sensor_anchor_kwh = raw.get("sensor_anchor_kwh")
         self._cost_chain_end = raw.get("cost_chain_end")
         self._last_cumulative_kwh = raw.get("last_cumulative_kwh")
         self._last_cumulative_cost = raw.get("last_cumulative_cost")
@@ -151,14 +164,21 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         return self._stats_frontier
 
-    async def store_stats_frontier(self, frontier: datetime, chain_end: float) -> None:
+    async def store_stats_frontier(self, frontier: datetime, anchor: float) -> None:
         self._stats_frontier = frontier
-        self._frontier_end = round(chain_end, 3)
+        self._frontier_end = round(anchor, 3)
+        # A new frontier restarts the settled interval ledger.
+        self._sensor_anchor_at = None
+        self._sensor_anchor_kwh = None
         await self._async_save_stored()
 
     def stored_frontier_end(self) -> float | None:
-        """Chain cumulative at the frontier — the sensor's anchor."""
+        """Sensor value at the frontier — the interval ledger's anchor."""
         return self._frontier_end
+
+    def published_kwh(self) -> float | None:
+        """The energy total last published (what the recorder has seen)."""
+        return self._last_cumulative_kwh
 
     async def store_frontier_end(self, value: float) -> None:
         self._frontier_end = round(value, 3)
@@ -175,6 +195,16 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def store_interval_state_seed(self, seed: float) -> None:
         """Persist the hourly-backfill state seed (continues phase-1 series)."""
         self._interval_state_seed = seed
+        await self._async_save_stored()
+
+    async def store_interval_progress(self, through: date, seed: float) -> None:
+        """Persist the hourly chain's resume day and its cumulative together.
+
+        Saved apart, a stop between the two writes would re-import the day
+        on top of a seed that already counts it — a phantom day of usage.
+        """
+        self._interval_through = through
+        self._interval_state_seed = round(seed, 3)
         await self._async_save_stored()
 
     async def _async_save_stored(self) -> None:
@@ -194,6 +224,12 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     else None
                 ),
                 "frontier_end": self._frontier_end,
+                "sensor_anchor_at": (
+                    self._sensor_anchor_at.isoformat()
+                    if self._sensor_anchor_at
+                    else None
+                ),
+                "sensor_anchor_kwh": self._sensor_anchor_kwh,
                 "cost_chain_end": self._cost_chain_end,
                 "last_cumulative_kwh": self._last_cumulative_kwh,
                 "last_cumulative_cost": self._last_cumulative_cost,
@@ -207,16 +243,29 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         routine: re-login transparently and retry once. Only a failed login
         (bad credentials) surfaces as ConfigEntryAuthFailed.
         """
+        # The fetch exercises the token straight away, so the login skips
+        # its own confirming usage request.
         try:
             if not self.client.bootstrapped:
-                await self.client.bootstrap(self._username, self._password)
+                await self.client.bootstrap(
+                    self._username, self._password, validate=False
+                )
             try:
                 data = await self._async_fetch_all()
             except NBPowerAuthError:
                 _LOGGER.debug("Widget token expired; logging in again")
                 self.client.invalidate()
-                await self.client.bootstrap(self._username, self._password)
-                data = await self._async_fetch_all()
+                await self.client.bootstrap(
+                    self._username, self._password, validate=False
+                )
+                try:
+                    data = await self._async_fetch_all()
+                except NBPowerAuthError as err:
+                    # The login just succeeded, so the credentials are fine:
+                    # retry next interval instead of demanding re-auth.
+                    raise UpdateFailed(
+                        f"NB Power rejected a fresh session: {err}"
+                    ) from err
         except NBPowerAuthError as err:
             raise ConfigEntryAuthFailed(
                 f"Could not sign in to NB Power: {err}"
@@ -254,7 +303,61 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._stats_extension_running = False
 
         self._stats_extension_running = True
-        self.hass.async_create_task(_run())
+        # Tied to the entry: cancelled on unload (a reloaded entry's old
+        # coordinator must not keep writing the chain) and not awaited at
+        # shutdown; the import resumes on the next refresh.
+        entry.async_create_background_task(
+            self.hass, _run(), f"{DOMAIN}_stats_extension_{entry.entry_id}"
+        )
+
+    async def _async_interval_ledger(
+        self, frontier: datetime, frontier_end: float, today: date
+    ) -> tuple[float, float]:
+        """Return (sensor total, today's kWh) from the 15-minute feed.
+
+        The total is the frontier anchor plus every interval published
+        since the frontier. Days that have fully published fold into a
+        persisted settled anchor, so a refresh only re-fetches the days
+        still filling in — summing from the frontier on every refresh grew
+        the request count daily, and capping that walk at MI_SINCE_DAYS
+        dropped all post-frontier usage once the frontier aged past it.
+        """
+        settled = (
+            self._sensor_anchor_at is not None and self._sensor_anchor_kwh is not None
+        )
+        anchor_at = self._sensor_anchor_at if settled else frontier
+        total = self._sensor_anchor_kwh if settled else frontier_end
+        settled_at, settled_kwh, settling = anchor_at, total, True
+        today_kwh = 0.0
+        day = anchor_at.date()
+        while day <= today:
+            rows = await self.client.get_interval_usage(day)
+            day_kwh = sum(
+                row.kwh or 0.0
+                for row in rows
+                if dt_util.as_local(row.start) >= anchor_at
+            )
+            total += day_kwh
+            if day == today:
+                today_kwh = day_kwh
+            # Only contiguous days settle: fully published ones, or ones old
+            # enough that a remaining gap is permanent (meter outage).
+            published = len({row.start.hour for row in rows}) >= 24
+            if (
+                settling
+                and day < today
+                and (published or (today - day).days > MI_SINCE_DAYS)
+            ):
+                settled_at = dt_util.start_of_local_day(day + timedelta(days=1))
+                settled_kwh = total
+            else:
+                settling = False
+            day += timedelta(days=1)
+        if settled_at != anchor_at:
+            self._sensor_anchor_at = settled_at
+            self._sensor_anchor_kwh = round(settled_kwh, 3)
+            await self._async_save_stored()
+        return round(total, 3), round(today_kwh, 3)
 
     async def _async_fetch_all(self) -> dict[str, Any]:
         now = dt_util.now()
@@ -269,9 +372,6 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         tentative = mtd or daily_mtd
 
         last_cycle_end = max((row.end.date() for row in monthly if row.end), default=None)
-        daily_end = max(
-            (row.start.date() for row in daily if row.kwh is not None), default=None
-        )
 
         # ONE LEDGER for the energy sensor: the 15-minute interval feed,
         # anchored at the statistics frontier. The books-based cumulative
@@ -283,7 +383,6 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         frontier = self.stored_stats_frontier()
         recent_days: dict[date, float] = {}
         today_kwh = 0.0
-        mi_since = 0.0
         if frontier is not None and self.stored_frontier_end() is None:
             # Migration for entries pinned before frontier_end existed:
             # seed + the frontier day's pre-frontier intervals.
@@ -299,27 +398,22 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self.store_frontier_end(
                     (self._interval_seed or 0.0) + round(pre, 3)
                 )
-            except NBPowerApiError:
+            except (NBPowerApiError, TimeoutError, aiohttp.ClientError):
                 _LOGGER.debug("Could not migrate frontier end yet")
         frontier_end = self.stored_frontier_end()
+        interval_total: float | None = None
         if frontier is not None and frontier_end is not None:
+            # A flaky interval request must not fail the whole refresh (and
+            # take every sensor unavailable): the books above already
+            # arrived, and the energy sensor can hold for one interval.
             try:
-                day = frontier.date()
-                while day <= today and (today - day).days <= MI_SINCE_DAYS:
-                    rows = await self.client.get_interval_usage(day)
-                    for row in rows:
-                        if dt_util.as_local(row.start) >= frontier:
-                            mi_since += row.kwh or 0.0
-                            if row.start.date() == today:
-                                today_kwh += row.kwh or 0.0
-                    day += timedelta(days=1)
-                mi_since = round(mi_since, 3)
-                today_kwh = round(today_kwh, 3)
-                if today_kwh:
-                    recent_days[today] = today_kwh
-            except NBPowerApiError:
+                interval_total, today_kwh = await self._async_interval_ledger(
+                    frontier, frontier_end, today
+                )
+            except (NBPowerApiError, TimeoutError, aiohttp.ClientError):
                 _LOGGER.debug("Interval feed unavailable; sensor holds")
-        recent_kwh = mi_since
+            if today_kwh:
+                recent_days[today] = today_kwh
 
         def _post_cycle(value) -> float:
             return sum(
@@ -331,7 +425,11 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         books_kwh = round(sum(row.kwh or 0.0 for row in monthly) + _post_cycle(lambda r: r.kwh), 2)
         if frontier is not None and frontier_end is not None:
-            books_kwh = round(frontier_end + recent_kwh, 2)
+            # An unavailable feed falls back to the anchor; the monotonic
+            # floor below then holds the last value.
+            books_kwh = round(
+                interval_total if interval_total is not None else frontier_end, 2
+            )
         books_cost = round(
             sum(row.amount or 0.0 for row in monthly) + _post_cycle(lambda r: r.amount), 2
         )
@@ -340,8 +438,6 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # dashboard treats a decreasing total_increasing sensor as a meter
         # reset (huge spikes). Hold the last value until the books catch
         # back up instead — under-counting slightly beats going backwards.
-        # books_kwh already includes recent_kwh when the frontier is active;
-        # adding it again would double-count the post-frontier usage.
         derived_kwh = books_kwh
         cumulative_kwh = (
             max(derived_kwh, self._last_cumulative_kwh)
@@ -361,7 +457,11 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_cumulative_cost = cumulative_cost
             await self._async_save_stored()
 
-        if not self.stats_imported and not self.history_rows:
+        # History feeds the day-resolution import and the hourly chain's
+        # starting seed, so keep it until the hourly chain has started.
+        if (
+            not self.stats_imported or self._interval_through is None
+        ) and not self.history_rows:
             self.history_rows = monthly + [
                 row
                 for row in daily
@@ -369,7 +469,8 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 and (last_cycle_end is None or row.start.date() > last_cycle_end)
             ]
 
-        last_row = daily[-1] if daily else None
+        # The newest window row can be a blank placeholder.
+        last_row = next((row for row in reversed(daily) if row.kwh is not None), None)
         return {
             "cumulative_kwh": cumulative_kwh,
             "cumulative_cost": cumulative_cost,

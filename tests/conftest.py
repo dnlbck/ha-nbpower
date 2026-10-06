@@ -237,8 +237,10 @@ def _usage_payload(mode: str, rtype: str, strdate: str | None, enddate, date_fro
         else:
             rows = _interval_rows(day)
             if state.get("partial_day") and day == today - timedelta(days=2):
-                # Live behavior: days publish partially (16 of 96 intervals)
-                rows = rows[:64]
+                # Live behavior: days publish in blocks, not always in
+                # order — a captured day had 64 of 96 intervals, hours
+                # 00-07 and 16-23, with the 08-15 block still missing.
+                rows = [r for r in rows if not 8 <= int(r["Hourly"][:2]) <= 15]
             data["objUsageGenerationResultSetTwo"] = rows
     else:
         data["objUsageGenerationResultSetTwo"] = []  # S: not used
@@ -403,10 +405,16 @@ def nbpower_urls(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def fast_backfill(monkeypatch):
-    """Keep the hourly backfill tiny and instant in all tests."""
+    """Keep the hourly backfill tiny and instant in all tests.
+
+    With the backfill option off, no hourly days are imported at all
+    unless a test raises INTERVAL_RECENT_DAYS: those tests exercise the
+    books-based sensor and the day-resolution import on their own.
+    """
     from custom_components.nbpower import statistics as nb_stats
 
     monkeypatch.setattr(nb_stats, "INTERVAL_BACKFILL_DAYS", 3)
+    monkeypatch.setattr(nb_stats, "INTERVAL_RECENT_DAYS", 0)
     monkeypatch.setattr(nb_stats, "INTERVAL_REQUEST_PAUSE", 0)
 
 
@@ -418,7 +426,7 @@ def hass_config_dir():
 
 @pytest_asyncio.fixture
 async def patched_helper_session(monkeypatch):
-    """Make HA's shared session tolerate the mock server's IP-literal host.
+    """Make the integration's sessions tolerate the mock server's IP literal.
 
     The integration normally talks to nbpower.com (a real domain), where the
     default cookie jar works fine.
@@ -433,8 +441,8 @@ async def patched_helper_session(monkeypatch):
         sessions.append(session)
         return session
 
-    monkeypatch.setattr(nb_init, "async_get_clientsession", _get)
-    monkeypatch.setattr(config_flow, "async_get_clientsession", _get)
+    monkeypatch.setattr(nb_init, "async_create_clientsession", _get)
+    monkeypatch.setattr(config_flow, "async_create_clientsession", _get)
     yield _get
     for session in sessions:
         await session.close()

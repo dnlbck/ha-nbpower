@@ -112,6 +112,9 @@ class NBPowerSensorEntity(CoordinatorEntity[NBPowerCoordinator], SensorEntity):
     """A sensor backed by the NB Power coordinator."""
 
     _attr_has_entity_name = True
+    # The trailing-window dict changes with every refresh; its history is
+    # already in statistics, so keep it out of the recorder's states.
+    _unrecorded_attributes = frozenset({"daily_kwh"})
 
     def __init__(
         self,

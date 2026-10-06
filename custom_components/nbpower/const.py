@@ -24,14 +24,15 @@ MIN_SCAN_INTERVAL = timedelta(minutes=30)
 INTERVAL_BACKFILL_DAYS = 365
 INTERVAL_REQUEST_PAUSE = 0.25
 
-# How many recent days to check for 15-minute data on every refresh. The
-# daily books lag several days; the interval feed publishes intraday, and
-# folding its newest days (strictly after the books' last day) into the
-# cumulative sensor is what makes "today" advance between book updates.
-MI_RECENT_DAYS = 7
+# Hourly window when the year-long backfill is turned off. The chain still
+# has to reach the statistics frontier, so these recent days (wider than
+# the daily books' publication lag) are always imported at hourly
+# resolution; only older history stays at day resolution.
+INTERVAL_RECENT_DAYS = 10
 
-# How many days of interval data to scan for the sensor value (the
-# frontier anchor plus post-frontier usage).
+# Age (days) at which the 15-minute feed is treated as final: data still
+# missing by then is a permanent gap (meter outage), so partial or empty
+# days that old are settled or imported as published instead of awaited.
 MI_SINCE_DAYS = 10
 
 CONF_BACKFILL_HOURLY = "backfill_hourly"

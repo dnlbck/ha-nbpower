@@ -14,7 +14,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
@@ -47,8 +47,12 @@ async def _validate_login(hass: HomeAssistant, username: str, password: str) -> 
     resolution and a usage-request validation. Raises
     ValueError("invalid_auth"|"cannot_connect") on failure.
     """
+    # Its own cookie jar, so this login cannot replace the portal session of
+    # an entry that is already running.
     client = NBPowerClient(
-        async_get_clientsession(hass), base_url=BASE_URL, widget_api_url=WIDGET_API_URL
+        async_create_clientsession(hass),
+        base_url=BASE_URL,
+        widget_api_url=WIDGET_API_URL,
     )
     try:
         await client.bootstrap(username, password)
@@ -104,15 +108,20 @@ class NBPowerConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         existing_entry = self._get_reauth_entry()
         if user_input is not None:
+            account_number = None
             try:
-                await _validate_login(
+                account_number = await _validate_login(
                     self.hass,
                     user_input[CONF_USERNAME],
                     user_input[CONF_PASSWORD],
                 )
             except ValueError as err:
                 errors["base"] = str(err.args[0])
-            if not errors:
+            if account_number:
+                # Another account's credentials would silently re-point this
+                # entry and append its usage to this account's statistics.
+                await self.async_set_unique_id(f"account_{account_number}")
+                self._abort_if_unique_id_mismatch(reason="wrong_account")
                 return self.async_update_reload_and_abort(
                     existing_entry, data=user_input
                 )

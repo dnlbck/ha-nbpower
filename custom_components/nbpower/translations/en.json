@@ -21,7 +21,9 @@
       "invalid_auth": "Invalid credentials, or NB Power blocked the login (sign in to the website once in a browser, then try again)."
     },
     "abort": {
-      "already_configured": "This NB Power account is already configured."
+      "already_configured": "This NB Power account is already configured.",
+      "reauth_successful": "Re-authentication was successful.",
+      "wrong_account": "These credentials belong to a different NB Power account than this entry."
     }
   },
   "options": {
@@ -29,7 +31,7 @@
       "init": {
         "data": {
           "scan_interval": "Update interval (hours)",
-          "backfill_hourly": "Backfill last year at hourly resolution (background, resumable)"
+          "backfill_hourly": "Backfill last year at hourly resolution (otherwise only the last 10 days; background, resumable)"
         }
       }
     }

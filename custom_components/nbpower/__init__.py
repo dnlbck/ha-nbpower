@@ -9,12 +9,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
 from .api import NBPowerClient
 from .const import (
     BASE_URL,
-    CONF_BACKFILL_HOURLY,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -42,8 +41,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: NBPowerConfigEntry) -> b
             "This entry uses an expired token; sign in with your username and password"
         )
 
+    # A dedicated session: the portal login lives in cookies, and the shared
+    # session's jar is common to every entry — two accounts logging in at
+    # once could pick up each other's widget token. Detached on unload.
     client = NBPowerClient(
-        async_get_clientsession(hass), base_url=BASE_URL, widget_api_url=WIDGET_API_URL
+        async_create_clientsession(hass),
+        base_url=BASE_URL,
+        widget_api_url=WIDGET_API_URL,
     )
     coordinator = NBPowerCoordinator(
         hass,
@@ -71,14 +75,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: NBPowerConfigEntry) -> b
     except Exception:  # noqa: BLE001
         _LOGGER.warning("Statistics backfill failed; will retry on restart", exc_info=True)
 
-    # Phase 2 (background): upgrade the last year to hourly resolution from
+    # Phase 2 (background): upgrade recent history to hourly resolution from
     # 15-minute data, one paced request per day; resumable across restarts.
-    if entry.options.get(CONF_BACKFILL_HOURLY, True):
-        backfill_task = hass.async_create_task(
-            async_backfill_hourly_statistics(hass, entry, coordinator),
-            f"{DOMAIN}_hourly_backfill_{entry.entry_id}",
-        )
-        entry.async_on_unload(lambda: backfill_task.cancel())
+    # It always runs — the chain must reach the frontier the energy sensor
+    # anchors to — and the backfill option only sets how far back it goes.
+    # Starting it now, in the same boot as phase 1, seeds its chain from the
+    # history phase 1 just imported.
+    entry.async_create_background_task(
+        hass,
+        async_backfill_hourly_statistics(hass, entry, coordinator),
+        f"{DOMAIN}_hourly_backfill_{entry.entry_id}",
+    )
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
