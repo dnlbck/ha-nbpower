@@ -77,6 +77,18 @@ async def test_bootstrap_rejects_bad_credentials(portal):
             await client.bootstrap("user@example.com", "wrong")
 
 
+async def test_bootstrap_adopts_the_portals_account_type(portal):
+    """VerifyToken reports AccountType; usage requests carry it as
+    UserType instead of an assumed Residential."""
+    portal.app["state"]["account_type"] = "General Service"
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as session:
+        client = _client(portal, session)
+        await client.bootstrap("user@example.com", "s3cret")
+        assert client.user_type == "General Service"
+        await client.get_daily_usage()
+        assert portal.app["usage_calls"][-1]["UserType"] == "General Service"
+
+
 async def test_interval_usage_returns_96_rows(client):
     """Mode=MI (uppercase) serves 15-minute intervals one day at a time."""
     from datetime import date, timedelta

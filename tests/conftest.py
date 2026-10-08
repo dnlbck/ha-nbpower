@@ -68,6 +68,17 @@ ACCOUNT_FORM = DEFAULT_FORM.format(
     ),
 )
 
+# The dedicated consumption page carries the token at the top of the form
+# (no ucConsumptionGraph segment), like the real ViewConsumptionGraph.aspx.
+GRAPH_FORM = DEFAULT_FORM.format(
+    action="/Customer/ViewConsumptionGraph.aspx",
+    extra=(
+        '<input type="hidden" '
+        'name="ctl00$contentPlaceHolder$accountSEWToken" '
+        f'value="{WIDGET_TOKEN}"/>'
+    ),
+)
+
 
 def _tentative_block() -> dict:
     """The real month-to-date block (only Mode=M carries real values)."""
@@ -308,7 +319,16 @@ def build_app() -> web.Application:
     async def account_page(request: web.Request) -> web.Response:
         if "auth" not in request.cookies:
             raise web.HTTPFound("/auth/weblogin.aspx")
+        if page := app["state"].get("account_page"):
+            return web.Response(text=page, content_type="text/html")
         return web.Response(text=ACCOUNT_FORM, content_type="text/html")
+
+    async def graph_page(request: web.Request) -> web.Response:
+        if "auth" not in request.cookies:
+            raise web.HTTPFound("/auth/weblogin.aspx")
+        if page := app["state"].get("graph_page"):
+            return web.Response(text=page, content_type="text/html")
+        return web.Response(text=GRAPH_FORM, content_type="text/html")
 
     # --- WidgetAPI ----------------------------------------------------
 
@@ -329,6 +349,7 @@ def build_app() -> web.Application:
                     "Data": {
                         "AccountNumber": int(ACCOUNT_NUMBER),
                         "UtilityAccountNumber": UTILITY_ACCOUNT_NUMBER,
+                        "AccountType": state.get("account_type", "Residential"),
                     },
                 },
             }
@@ -363,6 +384,7 @@ def build_app() -> web.Application:
             {
                 "Mode": body["Mode"],
                 "Type": body["Type"],
+                "UserType": body.get("UserType"),
                 "strdate": body.get("strdate"),
                 "DateFromDaily": body["DateFromDaily"],
                 "DateToDaily": body["DateToDaily"],
@@ -387,6 +409,7 @@ def build_app() -> web.Application:
     app.router.add_get("/auth/weblogin.aspx", login_page)
     app.router.add_post("/auth/weblogin.aspx", login_post)
     app.router.add_get("/Customer/AccountSummaryView.aspx", account_page)
+    app.router.add_get("/Customer/ViewConsumptionGraph.aspx", graph_page)
     app.router.add_post("/Token/VerifyToken", verify_token)
     app.router.add_post("/Usage/GetMultiMeter", multi_meter)
     app.router.add_post("/Usage/GetUsageGeneration", usage)

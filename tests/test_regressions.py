@@ -258,6 +258,8 @@ async def faulty_portal(socket_enabled):
             return web.Response(status=503, text="Service Unavailable")
         if (page := state.get("account_page")) and request.path.endswith("AccountSummaryView.aspx"):
             return web.Response(text=page, content_type="text/html")
+        if (page := state.get("graph_page")) and request.path.endswith("ViewConsumptionGraph.aspx"):
+            return web.Response(text=page, content_type="text/html")
         if state.get("reject_usage") and request.path.endswith("GetUsageGeneration"):
             return web.json_response(
                 {"result": {"Status": 0, "Message": "Token has been expired.", "Data": None}}
@@ -408,19 +410,61 @@ async def test_config_flow_missing_widget_token_is_a_portal_error(
     hass, faulty_portal, nbpower_urls, patched_helper_session,
     enable_custom_integrations, caplog,
 ):
-    """Issue #1: a sign-in that lands on a page without the usage graph
+    """Issue #1: a sign-in that lands on pages without the usage graph
     was reported as a network failure, with nothing in the log."""
     nbpower_urls(nb.server_base(faulty_portal))
-    faulty_portal.app["state"]["account_page"] = nb.DEFAULT_FORM.format(
+    tokenless = nb.DEFAULT_FORM.format(
         action="/Customer/SelectAccount.aspx", extra=""
     ).replace("<html>", "<html><head><title>Select an Account</title></head>")
+    faulty_portal.app["state"]["account_page"] = tokenless
+    faulty_portal.app["state"]["graph_page"] = tokenless
     result = await _user_flow(hass)
     assert result["type"] == FlowResultType.FORM
     assert result["errors"] == {"base": "portal_error"}
-    assert "No widget token on the account page" in caplog.text
+    assert "No widget token on the account pages" in caplog.text
     assert "'/Customer/AccountSummaryView.aspx'" in caplog.text
     assert "'Select an Account'" in caplog.text
+    assert "'/Customer/ViewConsumptionGraph.aspx'" in caplog.text
     assert FLOW_INPUT[CONF_PASSWORD] not in caplog.text
+
+
+async def test_config_flow_token_from_consumption_graph_page(
+    hass, faulty_portal, nbpower_urls, patched_helper_session,
+    enable_custom_integrations,
+):
+    """Issue #2: an account whose summary page renders no usage graph
+    (no ucConsumptionGraph control) still gets a token from the dedicated
+    consumption page."""
+    nbpower_urls(nb.server_base(faulty_portal))
+    faulty_portal.app["state"]["account_page"] = nb.DEFAULT_FORM.format(
+        action="/Customer/AccountSummaryView.aspx", extra=""
+    ).replace("<html>", "<html><head><title>Account Summary</title></head>")
+    result = await _user_flow(hass)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+
+
+async def test_config_flow_surfaces_the_portal_token_error(
+    hass, faulty_portal, nbpower_urls, patched_helper_session,
+    enable_custom_integrations, caplog,
+):
+    """The pages carry an accountSEWTokenError field the server fills in
+    when it could not mint a token; the log should say that, not just
+    'no token found'."""
+    nbpower_urls(nb.server_base(faulty_portal))
+    page = nb.DEFAULT_FORM.format(
+        action="/Customer/AccountSummaryView.aspx",
+        extra=(
+            '<input type="hidden" '
+            'name="ctl00$contentPlaceHolder$accountSEWTokenError" '
+            'value="Account is not enrolled"/>'
+        ),
+    )
+    faulty_portal.app["state"]["account_page"] = page
+    faulty_portal.app["state"]["graph_page"] = page
+    result = await _user_flow(hass)
+    assert result["errors"] == {"base": "portal_error"}
+    assert "Account is not enrolled" in caplog.text
 
 
 async def test_config_flow_finds_a_relocated_widget_token(

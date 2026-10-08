@@ -31,6 +31,18 @@ Observed API behavior (2026-09):
   lightweight usage request, not VerifyToken. Account numbers must be sent
   in the payload (HTTP 400 without them) and are not encoded in the token;
   the meter number may be empty.
+- Token source (2026-10 probe): both portal pages that host the usage
+  graph render a hidden ``accountSEWToken`` input — the account summary
+  (where the graph is a conditional ``ucConsumptionGraph`` control that
+  not every account gets) and ``/Customer/ViewConsumptionGraph.aspx``
+  (the graph's own page, token at the top of the form). Each page mints
+  its own token; both are accepted by VerifyToken, which is the widget's
+  own bootstrap call per SEW's ``Usage_Widget.min.js`` — the hidden
+  input is the browser's only token source (``/Token/GetToken`` answers
+  404, GET and POST). A sibling ``accountSEWTokenError`` input carries
+  the server's reason when minting failed for the account, and
+  VerifyToken's data also carries ``AccountType`` — the ``UserType``
+  usage requests are expected to send.
 
 This module must not import ``homeassistant`` so it can be unit tested and
 driven standalone by ``scripts/test_client.py``.
@@ -59,6 +71,14 @@ VALID_TYPES = {"K", "D"}  # K = kWh/kW, D = dollars
 _ASPNET_JSON_DATE_RE = re.compile(r"^/Date\((\d+)(?:[+-]\d+)?\)/$")
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})")
 _SEW_TOKEN_NAME_RE = re.compile(r"SEWToken$", re.IGNORECASE)
+_SEW_TOKEN_ERROR_NAME_RE = re.compile(r"SEWTokenError$", re.IGNORECASE)
+
+# Where login lands (the graph is a conditional control there, absent for
+# some accounts), then the graph's own page — both render accountSEWToken.
+_TOKEN_PAGES = (
+    "/Customer/AccountSummaryView.aspx",
+    "/Customer/ViewConsumptionGraph.aspx",
+)
 
 _DATE_FORMATS = (
     "%Y-%m-%dT%H:%M:%S",
@@ -265,6 +285,9 @@ class NBPowerClient:
         self.account_number: str | None = None
         self.utility_account_number: str | None = None
         self.meter_number: str | None = None
+        # The UserType usage requests carry; VerifyToken reports the real
+        # AccountType per account (browsers send that too).
+        self.user_type: str = "Residential"
 
     @property
     def bootstrapped(self) -> bool:
@@ -277,6 +300,7 @@ class NBPowerClient:
         self.account_number = None
         self.utility_account_number = None
         self.meter_number = None
+        self.user_type = "Residential"
 
     # ------------------------------------------------------------------
     # Public data access
@@ -306,6 +330,8 @@ class NBPowerClient:
             utility_account_number=data.get("UtilityAccountNumber"),
             validate=validate,
         )
+        # Set after bootstrap_with_token, whose invalidate() would reset it.
+        self.user_type = str(data.get("AccountType") or "Residential")
 
     async def bootstrap_with_token(
         self,
@@ -386,7 +412,7 @@ class NBPowerClient:
             "Token": self.token,
             "AccountNumber": self.account_number,
             "UtilityAccountNumber": self.utility_account_number,
-            "UserType": "Residential",
+            "UserType": self.user_type or "Residential",
             "Uom": "kW",
             # Observed live as "RES_URBAN"; the reference project sent
             # "RES_RURAL" successfully, so the value appears not to be
@@ -573,28 +599,40 @@ class NBPowerClient:
             raise NBPowerAuthError("Invalid credentials or blocked login")
 
     async def _account_token(self) -> str:
-        """Scrape the SEW widget token from the account summary page."""
-        html, final_url = await self._get_html("/Customer/AccountSummaryView.aspx")
-        if "weblogin.aspx" in final_url.lower():
-            raise NBPowerAuthError("Session did not survive login")
-        soup = BeautifulSoup(html, "html.parser")
-        fields, _ = self._form_fields(soup)
-        token = fields.get("ctl00$contentPlaceHolder$ucConsumptionGraph$accountSEWToken")
-        if token:
-            return token
-        # The control path in the field name follows the page layout; the
-        # name's tail is the stable part.
-        for el in soup.find_all("input", attrs={"name": _SEW_TOKEN_NAME_RE}):
-            if token := el.get("value"):
-                return token
-        # The WidgetAPI's /Token/GetToken (the reference project's fallback)
-        # answers HTTP 404 since at least 2026-10, so there is nothing else
-        # to try. Name the page the login landed on: an account picker or
-        # an interstitial notice are the likely reasons for a missing graph.
-        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        """Scrape the SEW widget token from the first portal page with one.
+
+        Both pages in ``_TOKEN_PAGES`` render the graph's hidden
+        ``accountSEWToken`` field (each page mints its own token; SEW's
+        Usage_Widget.min.js treats the hidden input as the token's only
+        source — there is no mint endpoint, /Token/GetToken 404s). The
+        account summary embeds the graph as a ``ucConsumptionGraph``
+        control that not every account gets; the dedicated consumption
+        page carries the token at the top of its form, so it is the second
+        chance for accounts whose summary shows no graph. Each page also
+        renders an ``accountSEWTokenError`` sibling the server fills in
+        when it could not mint a token — the closest thing to an official
+        reason, so it is surfaced in the error.
+        """
+        attempted: list[str] = []
+        for path in _TOKEN_PAGES:
+            html, final_url = await self._get_html(path)
+            if "weblogin.aspx" in final_url.lower():
+                raise NBPowerAuthError("Session did not survive login")
+            soup = BeautifulSoup(html, "html.parser")
+            for el in soup.find_all("input", attrs={"name": _SEW_TOKEN_NAME_RE}):
+                if token := el.get("value"):
+                    return token
+            detail = ""
+            for el in soup.find_all("input", attrs={"name": _SEW_TOKEN_ERROR_NAME_RE}):
+                if message := (el.get("value") or "").strip():
+                    detail = f", server said {message!r}"
+                    break
+            if not detail:
+                title = soup.title.get_text(" ", strip=True) if soup.title else ""
+                detail = f", title {title!r}"
+            attempted.append(f"{urlsplit(final_url).path!r}{detail}")
         raise NBPowerApiError(
-            "No widget token on the account page (landed on "
-            f"{urlsplit(final_url).path!r}, title {title!r})"
+            "No widget token on the account pages (" + "; ".join(attempted) + ")"
         )
 
     async def _verify_token(self, token: str) -> dict[str, Any]:
