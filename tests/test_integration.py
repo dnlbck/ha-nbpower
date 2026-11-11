@@ -18,6 +18,7 @@ from conftest import (
     _daily_window,
     _interval_rows,
     _monthly_cycles,
+    recorder_done,
     server_base,
 )
 from custom_components.nbpower.const import DOMAIN
@@ -181,7 +182,7 @@ async def test_history_statistics_imported(
     from homeassistant.components.recorder.statistics import statistics_during_period
 
     entry = await _setup_entry(hass, portal, nbpower_urls, backfill_hourly=False)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     statistic_id = _entity_id(hass, entry, ENERGY_KEY)
     stats = await get_instance(hass).async_add_executor_job(
@@ -251,7 +252,7 @@ async def test_reauth_with_credentials_recovers_entry(
     patched_helper_session,
     enable_custom_integrations,
 ):
-    """Bad credentials trigger re-auth; correct ones recover the entry."""
+    """A stored password the portal no longer takes; re-auth recovers the entry."""
     nbpower_urls(server_base(portal))
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -262,7 +263,11 @@ async def test_reauth_with_credentials_recovers_entry(
     entry.add_to_hass(hass)
     assert not await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    assert entry.state is entry.state.SETUP_ERROR
+    # Turned away, which is not taken for proof of a wrong password at
+    # once: the setup is retried, and re-authentication requested only if
+    # it goes on (tests/test_sign_in.py). Entering the password works at
+    # any point.
+    assert entry.state is entry.state.SETUP_RETRY
 
     result = await entry.start_reauth_flow(hass)
     assert result["step_id"] == "reauth_confirm"
@@ -362,9 +367,9 @@ async def test_hourly_backfill_upgrades_resolution(
     from homeassistant.components.recorder.statistics import statistics_during_period
 
     entry = await _setup_entry(hass, portal, nbpower_urls)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     statistic_id = _entity_id(hass, entry, ENERGY_KEY)
     stats = await get_instance(hass).async_add_executor_job(
@@ -437,7 +442,7 @@ async def test_repair_generation_reimports_consistently(
 
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     statistic_id = _entity_id(hass, entry, ENERGY_KEY)
     stats = await get_instance(hass).async_add_executor_job(
@@ -494,7 +499,7 @@ async def test_extension_imports_newly_published_days(
     await coordinator.store_interval_through(yesterday - timedelta(days=1))
     await entry.runtime_data.async_refresh()
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     statistic_id = _entity_id(hass, entry, ENERGY_KEY)
     stats = await get_instance(hass).async_add_executor_job(
@@ -541,7 +546,7 @@ async def test_partial_day_not_marked_complete(
     today = date.today()
     partial_day = today - timedelta(days=2)
     assert coordinator.stored_interval_through() == partial_day - timedelta(days=1)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     statistic_id = _entity_id(hass, entry, ENERGY_KEY)
     stats = await get_instance(hass).async_add_executor_job(
@@ -563,7 +568,7 @@ async def test_partial_day_not_marked_complete(
     portal.app["state"]["partial_day"] = False
     await coordinator.async_refresh()
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     assert coordinator.stored_interval_through() >= partial_day
     stats = await get_instance(hass).async_add_executor_job(
@@ -600,7 +605,7 @@ async def test_cost_history_imported(
     from homeassistant.components.recorder.statistics import statistics_during_period
 
     entry = await _setup_entry(hass, portal, nbpower_urls, backfill_hourly=False)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     cost_id = _entity_id(hass, entry, "cost_usage")
     stats = await get_instance(hass).async_add_executor_job(
@@ -638,7 +643,7 @@ async def test_stats_frontier_pins_and_limits_imports(
 
     entry = await _setup_entry(hass, portal, nbpower_urls)
     coordinator = entry.runtime_data
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     frontier = coordinator.stored_stats_frontier()
     assert frontier is not None and frontier <= datetime.now(frontier.tzinfo)
@@ -656,7 +661,7 @@ async def test_stats_frontier_pins_and_limits_imports(
     await coordinator.store_interval_through(yesterday - timedelta(days=1))
     await coordinator.async_refresh()
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     stats = await get_instance(hass).async_add_executor_job(
         statistics_during_period, hass, dt_util.utc_from_timestamp(0), dt_util.now(),
@@ -690,14 +695,11 @@ async def test_frontier_day_prefrontier_hours_imported_and_anchor_syncs(
     post-frontier hours drive the sensor from the chain-end anchor, and
     the anchor syncs forward when the chain grows under the frontier.
     """
-    from homeassistant.components.recorder import get_instance
-    from homeassistant.components.recorder.statistics import statistics_during_period
-
     from conftest import _interval_rows
 
     entry = await _setup_entry(hass, portal, nbpower_urls, backfill_hourly=False)
     coordinator = entry.runtime_data
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     # A chain through the day before yesterday; frontier pinned at local
     # noon YESTERDAY (mid-day, like a restart-time pin). Seed far above
@@ -711,11 +713,11 @@ async def test_frontier_day_prefrontier_hours_imported_and_anchor_syncs(
 
     await coordinator.async_refresh()
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
     # Second refresh: the first one synced the anchor mid-flight.
     await coordinator.async_refresh()
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     rows_by_day = await _stats_rows(hass, _entity_id(hass, entry, ENERGY_KEY))
     day_rows = rows_by_day.get(frontier_day, [])
@@ -774,7 +776,6 @@ async def test_align_lifts_reseeded_native_block_exactly_once(
     consecutive repair compounds off stale values and balloons the tail —
     the phantom double +69k hours seen live on 2026-09-29.
     """
-    from homeassistant.components.recorder import get_instance
     from homeassistant.components.recorder.models import (
         StatisticData,
         StatisticMetaData,
@@ -785,7 +786,7 @@ async def test_align_lifts_reseeded_native_block_exactly_once(
     from custom_components.nbpower.statistics import _async_align_native_block
 
     entry = await _setup_entry(hass, portal, nbpower_urls, backfill_hourly=False)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
     statistic_id = _entity_id(hass, entry, ENERGY_KEY)
 
     meta = StatisticMetaData(
@@ -808,10 +809,10 @@ async def test_align_lifts_reseeded_native_block_exactly_once(
             StatisticData(start=midnight + timedelta(hours=3), state=42.0, sum=41.0),  # interior dip
         ],
     )
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     await _async_align_native_block(hass, statistic_id, midnight, 100.0)
-    await get_instance(hass).async_block_till_done()
+    await recorder_done(hass)
 
     rows = (await _stats_rows(hass, statistic_id))[date.today()]
     sums = {dt_util.as_local(dt_util.utc_from_timestamp(r["start"])).hour: r["sum"] for r in rows}

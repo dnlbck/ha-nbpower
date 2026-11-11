@@ -15,6 +15,9 @@ once the portal publishes it:
 * on every refresh, each day after the last complete one is fetched and
   rewritten, so blocks published out of order land in their own hours and
   the later rows' sums follow.
+
+The cumulative cost sensor follows the cost chain's total (the books it
+used to sum only cover the last 36 billing cycles).
 """
 
 from __future__ import annotations
@@ -158,6 +161,7 @@ async def async_update_external_statistics(
     energy_total: float = state["energy_sum"]
     cost_total: float = state["cost_sum"]
     contiguous = True
+    reached_today = True
     written = 0
     day = through + timedelta(days=1)
     while day <= today:
@@ -170,6 +174,7 @@ async def async_update_external_statistics(
                 day,
                 err,
             )
+            reached_today = False
             break
         if hours := hour_buckets(rows):
             energy_rows, energy_total = _chain(
@@ -208,6 +213,10 @@ async def async_update_external_statistics(
             written,
             state["through"],
         )
+    if reached_today:
+        # The whole chain was walked, so its total counts every published
+        # hour: the cumulative cost sensor follows it.
+        await coordinator.async_statistics_cost(state.get("chain"), cost_total)
 
 
 async def _async_start_chain(
@@ -248,6 +257,9 @@ async def _async_start_chain(
         async_add_external_statistics(hass, cost_meta, cost_rows)
     state = {
         "gen": EXTERNAL_GEN,
+        # Names this chain: one started later has other sums, and the cost
+        # sensor has to take it up afresh (coordinator.async_statistics_cost).
+        "chain": dt_util.utcnow().isoformat(),
         "window_start": window_start.isoformat(),
         "through": (window_start - timedelta(days=1)).isoformat(),
         "energy_sum": energy_total,

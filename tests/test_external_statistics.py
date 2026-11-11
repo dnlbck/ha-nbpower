@@ -6,6 +6,7 @@ from datetime import date, datetime, time, timedelta
 from functools import partial
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import pytest
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import get_metadata, statistics_during_period
@@ -33,14 +34,14 @@ async def _setup(hass, portal, nbpower_urls):
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await nb.recorder_done(hass)
     return entry
 
 
 async def _refresh(hass, coordinator):
     await coordinator.async_refresh()
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await nb.recorder_done(hass)
 
 
 async def _rows(hass, statistic_id):
@@ -51,9 +52,9 @@ async def _rows(hass, statistic_id):
     return sorted(stats.get(statistic_id, []), key=lambda r: r["start"])
 
 
-def _sensor_value(hass, entry) -> float:
+def _sensor_value(hass, entry, key="energy_usage") -> float:
     entity_id = er.async_get(hass).async_get_entity_id(
-        "sensor", DOMAIN, f"{entry.entry_id}_energy_usage"
+        "sensor", DOMAIN, f"{entry.entry_id}_{key}"
     )
     return float(hass.states.get(entity_id).state)
 
@@ -152,11 +153,13 @@ async def test_upgraded_install_starts_the_statistics(
     coord = entry.runtime_data
     energy_id, cost_id = statistic_ids(entry, coord)
     assert coord.stored_stats_frontier() is not None
+    first_chain = coord.external_state()["chain"]
     await coord.async_store_external_state({})
     coord.history_rows = []
     get_instance(hass).async_clear_statistics([energy_id, cost_id])
-    await get_instance(hass).async_block_till_done()
+    await nb.recorder_done(hass)
     value = _sensor_value(hass, entry)
+    cost = _sensor_value(hass, entry, "cost_usage")
 
     await _refresh(hass, coord)
     state = coord.external_state()
@@ -165,6 +168,109 @@ async def test_upgraded_install_starts_the_statistics(
     assert _local(rows[0]).date() < date.fromisoformat(state["window_start"])
     # The sensor is not part of this chain.
     assert _sensor_value(hass, entry) >= value
+    # The cost sensor is, and takes a new chain up from where it stood.
+    assert state["chain"] != first_chain
+    assert coord.stored_state()["cost_ledger"]["chain"] == state["chain"]
+    assert _sensor_value(hass, entry, "cost_usage") == pytest.approx(cost, abs=0.011)
+
+
+async def test_cost_sensor_follows_the_statistics_not_the_books(
+    recorder_mock, hass, portal, nbpower_urls, patched_helper_session, enable_custom_integrations,
+    monkeypatch,
+):
+    """Live: the portal lists only the last 36 billing cycles. Each time a
+    new one posts the oldest drops out and the books' sum falls by a whole
+    cycle, so the cost sensor, held at its last value, stood still for
+    weeks at a time."""
+    held_back = date.today() - timedelta(days=2)
+    portal.app["state"]["partial_day"] = True
+    entry = await _setup(hass, portal, nbpower_urls)
+    coord = entry.runtime_data
+    before = _sensor_value(hass, entry, "cost_usage")
+
+    # The oldest cycle drops out of the books (they total less than before)
+    # while the portal publishes the hours it was holding back.
+    cycles = nb._monthly_cycles
+    monkeypatch.setattr(nb, "_monthly_cycles", lambda: cycles(35))
+    portal.app["state"]["partial_day"] = False
+    await _refresh(hass, coord)
+
+    published = sum(
+        cost for start, _, cost in _portal_hours(held_back) if 8 <= start.hour <= 15
+    )
+    assert cycles(36)[-1]["Amount"] > 100 > published > 0.5
+    assert _sensor_value(hass, entry, "cost_usage") == pytest.approx(
+        before + published, abs=0.011
+    )
+
+
+async def test_upgrade_takes_the_cost_sensor_up_where_it_stood(
+    recorder_mock, hass, hass_storage, portal, nbpower_urls, patched_helper_session,
+    enable_custom_integrations,
+):
+    """Storage written by 0.12: no cost ledger, session or sign-in history,
+    a chain without a name, and the cost sensor held above what the books
+    have come down to (live, since a cycle dropped out of them)."""
+    held_back = date.today() - timedelta(days=2)
+    portal.app["state"]["partial_day"] = True
+    entry = await _setup(hass, portal, nbpower_urls)
+    held_at = _sensor_value(hass, entry, "cost_usage") + 300
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    stored = hass_storage[f"nbpower.{entry.entry_id}"]["data"]
+    for key in ("cost_ledger", "session", "sign_in"):
+        del stored[key]
+    del stored["external"]["chain"]
+    stored["last_cumulative_cost"] = held_at
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    await nb.recorder_done(hass)
+    # No step on the way in...
+    assert _sensor_value(hass, entry, "cost_usage") == pytest.approx(held_at, abs=0.011)
+
+    # ...and it moves again with the first hours that are published.
+    portal.app["state"]["partial_day"] = False
+    await _refresh(hass, entry.runtime_data)
+    published = sum(
+        cost for start, _, cost in _portal_hours(held_back) if 8 <= start.hour <= 15
+    )
+    assert _sensor_value(hass, entry, "cost_usage") == pytest.approx(
+        held_at + published, abs=0.011
+    )
+
+
+async def test_cost_sensor_waits_for_a_pass_that_reaches_today(
+    recorder_mock, hass, portal, nbpower_urls, patched_helper_session, enable_custom_integrations,
+    monkeypatch,
+):
+    """A pass cut short has not counted every published hour; the total it
+    got to says nothing about where the sensor should stand."""
+    held_back = date.today() - timedelta(days=2)
+    portal.app["state"]["partial_day"] = True
+    entry = await _setup(hass, portal, nbpower_urls)
+    coord = entry.runtime_data
+    before = _sensor_value(hass, entry, "cost_usage")
+    hourly = coord.client.get_hourly_usage
+
+    async def _fails_on_yesterday(day):
+        if day == date.today() - timedelta(days=1):
+            raise aiohttp.ClientConnectionError("connection reset")
+        return await hourly(day)
+
+    monkeypatch.setattr(coord.client, "get_hourly_usage", _fails_on_yesterday)
+    portal.app["state"]["partial_day"] = False
+    await _refresh(hass, coord)
+    assert _sensor_value(hass, entry, "cost_usage") == before
+
+    monkeypatch.setattr(coord.client, "get_hourly_usage", hourly)
+    await _refresh(hass, coord)
+    published = sum(
+        cost for start, _, cost in _portal_hours(held_back) if 8 <= start.hour <= 15
+    )
+    assert _sensor_value(hass, entry, "cost_usage") == pytest.approx(
+        before + published, abs=0.011
+    )
 
 
 async def test_restart_resumes_without_rewriting_history(

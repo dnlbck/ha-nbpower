@@ -48,16 +48,67 @@ DEFAULT_FORM = """
 </form></body></html>
 """
 
-LOGIN_FORM = DEFAULT_FORM.format(
-    action="/auth/weblogin.aspx",
-    extra="""
-<input type="text" name="ctl00$contentPlaceHolder$txtUsername"/>
-<input type="password" name="ctl00$contentPlaceHolder$txtPassword"/>
-<input type="submit" name="ctl00$contentPlaceHolder$btnLogin" value="Login"/>
-<input type="hidden" name="ctl00$contentPlaceHolder$hdnCaptchaText" value=""/>
+# A notice put up ahead of time: on the login page before and after a
+# sign-in alike, with the form still open, so it is not what the portal
+# says about a sign-in it turned away.
+SITE_NOTICE = "MyAccount will be unavailable Sunday from 2 to 4 a.m."
+# The notice of the window itself, as the live page carried it (2026-11-11)
+# while its login controls were disabled.
+MAINTENANCE_NOTICE = (
+    "Scheduled Maintenance NB Power online services will be unavailable from "
+    "Tuesday, November 10 at 5:00pm until Wednesday, November 11 at 10:00pm "
+    "due to system maintenance. Our apologies for the inconvenience."
+)
+WRONG_PASSWORD_ALERT = "The username or password you entered is incorrect."
+REFUSED_ALERT = "We are unable to log you in at this time. Please try again later."
+
+
+def login_form(alert: str = "", captcha: bool = False, maintenance: bool = False) -> str:
+    """The login page, shaped like the portal's: an alert area for what it
+    has to say, a word-verification fieldset that stays empty until the
+    portal wants one, and — during scheduled maintenance — the login
+    controls rendered disabled under a notice of the window."""
+    if maintenance:
+        heading, _, body = MAINTENANCE_NOTICE.partition(" NB Power ")
+        notice_html = (
+            f'<div class="alert"><div><p><strong>{heading}</strong></p>'
+            f"<p>&nbsp;</p><p>NB Power {body}</p></div></div>"
+        )
+    else:
+        notice_html = f'<div class="alert notice"><p>{SITE_NOTICE}</p></div>'
+    alert_html = (
+        f'<div class="alert alert-error" role="alert"><p>{alert}</p></div>'
+        if alert.strip()
+        else ""
+    )
+    captcha_html = (
+        '<img id="ctl00_contentPlaceHolder_captcha_CaptchaImage" '
+        'class="BDC_CaptchaImage" src="/BotDetectCaptcha.ashx?get=image" '
+        'alt="Retype the CAPTCHA code from the image"/>'
+        '<input type="text" name="ctl00$contentPlaceHolder$txtCaptchaCode"/>'
+        if captcha
+        else ""
+    )
+    off = ' disabled="disabled" class="aspNetDisabled"' if maintenance else ""
+    return DEFAULT_FORM.format(
+        action="/auth/weblogin.aspx",
+        extra=f"""
+<div class="alertsContainer">
+{notice_html}
+{alert_html}
+</div>
+<input type="text" name="ctl00$contentPlaceHolder$txtUsername"{off}/>
+<input type="password" name="ctl00$contentPlaceHolder$txtPassword"{off}/>
+<fieldset id="ctl00_contentPlaceHolder_fsCaptcha">
+<legend class="screenReaderOnly"><span>Word Verification</span></legend>
+{captcha_html}
+</fieldset>
+<input type="submit" name="ctl00$contentPlaceHolder$btnLogin" value="Login"{off}/>
+<input type="hidden" name="ctl00$contentPlaceHolder$hdnCaptchaText"
+ value="BotDetect CAPTCHA ASP.NET Form Validation"/>
 <input type="text" name="ctl00$txtSearch" value=""/>
 """,
-)
+    ).replace("<html>", "<html><head><title>Login</title></head>")
 
 ACCOUNT_FORM = DEFAULT_FORM.format(
     action="/Customer/AccountSummaryView.aspx",
@@ -301,12 +352,34 @@ def build_app() -> web.Application:
         raise resp
 
     async def login_page(request: web.Request) -> web.Response:
-        return web.Response(text=LOGIN_FORM, content_type="text/html")
+        # Live: for scheduled maintenance the page stays up, with its login
+        # controls disabled and a notice of the window.
+        return web.Response(
+            text=login_form(maintenance=bool(state.get("maintenance"))),
+            content_type="text/html",
+        )
 
     async def login_post(request: web.Request) -> web.Response:
         form = await request.post()
         username = form.get("ctl00$contentPlaceHolder$txtUsername", "")
         password = form.get("ctl00$contentPlaceHolder$txtPassword", "")
+        app["login_posts"].append(username)
+        if state.get("maintenance"):
+            # A disabled button raises no event: the form just comes back.
+            return web.Response(
+                text=login_form(maintenance=True), content_type="text/html"
+            )
+        if refusal := state.get("reject_login"):
+            # A sign-in turned away with the form open: the login page
+            # again. True for a generic wording, or the alert to show
+            # (blank for a refusal without a word).
+            return web.Response(
+                text=login_form(
+                    REFUSED_ALERT if refusal is True else refusal,
+                    captcha=bool(state.get("login_captcha")),
+                ),
+                content_type="text/html",
+            )
         if VALID_CREDS.get(username) == password:
             # A fresh login mints a fresh session token.
             state["expire_widget_token"] = False
@@ -314,7 +387,9 @@ def build_app() -> web.Application:
             resp.set_cookie("auth", "1")
             raise resp
         # Failed logins re-render the login page (same URL) like the portal.
-        return web.Response(text=LOGIN_FORM, content_type="text/html")
+        return web.Response(
+            text=login_form(WRONG_PASSWORD_ALERT), content_type="text/html"
+        )
 
     async def account_page(request: web.Request) -> web.Response:
         if "auth" not in request.cookies:
@@ -334,7 +409,7 @@ def build_app() -> web.Application:
 
     async def verify_token(request: web.Request) -> web.Response:
         body = await request.json()
-        if body.get("Token") != WIDGET_TOKEN:
+        if body.get("Token") != WIDGET_TOKEN or state.get("verify_rejects"):
             # Real API: HTTP 200 with result.Status=0 for a dead token.
             return web.json_response(
                 {"result": {"Status": 0, "Message": "Token has been expired.", "Data": None}}
@@ -403,6 +478,7 @@ def build_app() -> web.Application:
         )
 
     app["usage_calls"] = []
+    app["login_posts"] = []
     app["state"] = state
     app.router.add_get("/Default.aspx", default_page)
     app.router.add_post("/Default.aspx", default_post)
@@ -429,6 +505,24 @@ async def portal(socket_enabled):
 
 def server_base(server: TestServer) -> str:
     return f"http://{server.host}:{server.port}"
+
+
+async def recorder_done(hass) -> None:
+    """Wait until the recorder has worked off everything queued so far.
+
+    ``Recorder.async_block_till_done()`` returns at once when its queue is
+    empty — and from Python 3.13 on, a task put on an idle recorder's queue
+    is handed straight to its thread without ever being in the queue. The
+    statistics it was supposed to wait for then get read before they are
+    written, now and then (about one run in fifty of a test that imports
+    rows and reads them back).
+    """
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.tasks import SynchronizeTask
+
+    done = hass.loop.create_future()
+    get_instance(hass).queue_task(SynchronizeTask(done))
+    await done
 
 
 @pytest.fixture

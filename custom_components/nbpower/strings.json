@@ -14,17 +14,26 @@
           "username": "Username",
           "password": "Password"
         }
+      },
+      "reconfigure": {
+        "description": "Enter the NB Power MyAccount username and password to use from now on. Entering the current ones again also signs in right away, without waiting for the next attempt.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
       }
     },
     "error": {
       "cannot_connect": "Failed to connect to NB Power. Check your network and try again.",
-      "invalid_auth": "Invalid credentials, or NB Power blocked the login (sign in to the website once in a browser, then try again).",
+      "invalid_auth": "NB Power turned the sign-in away.{reason} Check the username and password; if they work at www.nbpower.com, try again later.",
+      "sign_in_closed": "NB Power is not taking sign-ins at the moment (it closes its login form for scheduled maintenance).{reason} Try again when it is back.",
       "portal_error": "NB Power's portal returned an unexpected response during sign-in. The Home Assistant log has the details (search for nbpower).",
       "unknown": "Unexpected error during sign-in. The Home Assistant log has the details (search for nbpower)."
     },
     "abort": {
       "already_configured": "This NB Power account is already configured.",
       "reauth_successful": "Re-authentication was successful.",
+      "reconfigure_successful": "Signed in; the integration is using these credentials now.",
       "wrong_account": "These credentials belong to a different NB Power account than this entry."
     }
   },
@@ -35,6 +44,31 @@
           "scan_interval": "Update interval (hours)",
           "backfill_hourly": "Backfill last year at hourly resolution (otherwise only the last 10 days; background, resumable)"
         }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "energy_usage": {
+        "name": "Energy usage"
+      },
+      "cost_usage": {
+        "name": "Cost usage"
+      },
+      "last_daily_energy": {
+        "name": "Last daily energy"
+      },
+      "month_to_date_energy": {
+        "name": "Month-to-date energy"
+      },
+      "month_to_date_cost": {
+        "name": "Month-to-date cost"
+      },
+      "projected_energy": {
+        "name": "Projected energy"
+      },
+      "projected_bill": {
+        "name": "Projected bill"
       }
     }
   }

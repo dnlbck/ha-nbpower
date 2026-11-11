@@ -43,6 +43,25 @@ Observed API behavior (2026-09):
   the server's reason when minting failed for the account, and
   VerifyToken's data also carries ``AccountType`` — the ``UserType``
   usage requests are expected to send.
+- Scheduled maintenance (2026-11-10/11, live): the portal switches its
+  login form off. The page is served as usual, with the username,
+  password and Login controls rendered ``disabled`` (class
+  ``aspNetDisabled``) and a notice in its ``alertsContainer`` giving the
+  window ("Scheduled Maintenance ... unavailable from Tuesday, November
+  10 at 5:00pm until Wednesday, November 11 at 10:00pm"; such notices can
+  also be up ahead of time, with the form still open). A sign-in posted
+  anyway comes back as the login page again, exactly like a wrong
+  password. That is what the six outages of October/November 2026 looked
+  like from the inside (the earlier five were not captured), each ending
+  only when the password was typed in again.
+- The login page otherwise: the ``alertsContainer`` for messages, a
+  Telerik RadWindowManager (``radalert``) for message boxes, an empty
+  "Word Verification" fieldset (``fsCaptcha``) for a BotDetect CAPTCHA,
+  and a hidden ``hdnCaptchaText`` preset to BotDetect's default text.
+  What it answers to a wrong password or a required word verification
+  has not been captured.
+- The website sits behind Cloudflare and is not served to every country:
+  from outside it answers HTTP 403 "Access Unavailable" (2026-11).
 
 This module must not import ``homeassistant`` so it can be unit tested and
 driven standalone by ``scripts/test_client.py``.
@@ -60,8 +79,14 @@ from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from bs4 import BeautifulSoup
+from bs4.element import CData, NavigableString
 
-from .exceptions import NBPowerApiError, NBPowerAuthError
+from .exceptions import (
+    NBPowerApiError,
+    NBPowerAuthError,
+    NBPowerSignInClosed,
+    NBPowerSignInRejected,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -94,6 +119,167 @@ _DATE_FORMATS = (
 )
 
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=45)
+
+# How a page marks the places it reports problems in (the portal's own
+# alerts sit in an ``alertsContainer``), and a word verification (the login
+# form has a "Word Verification" fieldset that BotDetect fills in).
+_MESSAGE_HINT_RE = re.compile(
+    r"alert|error|invalid|fail|warn|validat|message|msg|notif|notice|summary"
+    r"|status|feedback|danger",
+    re.IGNORECASE,
+)
+_CAPTCHA_HINT_RE = re.compile(r"captcha|botdetect|BDC_|turnstile", re.IGNORECASE)
+_HIDDEN_STYLE_RE = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*hidden", re.IGNORECASE
+)
+# alert('...') and Telerik's radalert('...', width, ...): the portal's pages
+# carry a RadWindowManager for message boxes.
+_JS_ALERT_RE = re.compile(r"""\b(?:rad)?alert\(\s*(['"])(.+?)\1\s*[,)]""", re.DOTALL)
+# Elements whose text is not something the page says to its reader, and
+# ones too broad for their name to mark a message.
+_NOT_SHOWN = ("script", "style", "title", "option", "textarea", "noscript")
+_NOT_A_MESSAGE = ("html", "body", "form")
+_REASON_LENGTH = 300
+
+
+def _shape(body: Any) -> str:
+    """Describe a payload without quoting it (it can hold account details)."""
+    if isinstance(body, dict):
+        return f"an object with keys {sorted(map(str, body))[:8]}"
+    return f"a {type(body).__name__}"
+
+
+def _describe(soup: BeautifulSoup, status: int) -> str:
+    """A page in a few words, for the error about what it lacks."""
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    return f"HTTP {status}, title {title!r}"
+
+
+def _marks(element: Any, *attributes: str) -> str:
+    """The element's values for the attributes, joined for a pattern search."""
+    values: list[str] = []
+    for attribute in attributes:
+        value = element.get(attribute) or []
+        values.extend([value] if isinstance(value, str) else map(str, value))
+    return " ".join(values)
+
+
+def _hidden(element: Any) -> bool:
+    """True when the markup itself hides the element."""
+    return element.get("hidden") is not None or bool(
+        _HIDDEN_STYLE_RE.search(element.get("style") or "")
+    )
+
+
+def _page_text(soup: BeautifulSoup, *, messages_only: bool) -> list[str]:
+    """The pieces of text a page shows, in order, each once.
+
+    ``messages_only`` keeps the text of elements whose id, class or role
+    marks them as alerts or validation messages, plus what scripts put in
+    an ``alert()``.
+    """
+    pieces: list[str] = []
+    for node in soup.find_all(string=True):
+        # Exactly these: comments, scripts and styles are subclasses.
+        if type(node) not in (NavigableString, CData):
+            continue
+        text = " ".join(node.split())
+        if not text or text in pieces:
+            continue
+        shown = True
+        marked = not messages_only
+        for parent in node.parents:
+            if parent.name in _NOT_SHOWN or _hidden(parent):
+                shown = False
+                break
+            if (
+                not marked
+                and parent.name not in _NOT_A_MESSAGE
+                and _MESSAGE_HINT_RE.search(_marks(parent, "id", "class", "role"))
+            ):
+                marked = True
+        if shown and marked:
+            pieces.append(text)
+    for script in soup.find_all("script"):
+        for match in _JS_ALERT_RE.finditer(script.string or ""):
+            text = " ".join(match.group(2).split())
+            if text and text not in pieces:
+                pieces.append(text)
+    return pieces
+
+
+def _shows_word_verification(soup: BeautifulSoup) -> bool:
+    """True when a page shows a CAPTCHA image or asks for its answer."""
+    for element in soup.find_all(["img", "input", "iframe"]):
+        if element.name == "input" and (element.get("type") or "text").lower() in (
+            "hidden",
+            "submit",
+            "image",
+            "button",
+        ):
+            continue
+        if _CAPTCHA_HINT_RE.search(
+            _marks(element, "id", "name", "class", "src")
+        ) and not any(_hidden(node) for node in (element, *element.parents)):
+            return True
+    return False
+
+
+def _quoted(pieces: list[str], secrets: tuple[str, ...] = ()) -> str | None:
+    """Pieces of page text as one quotable string, without the secrets."""
+    text = " ".join(pieces)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "…")
+    if len(text) > _REASON_LENGTH:
+        text = text[: _REASON_LENGTH - 1] + "…"
+    return text or None
+
+
+def _notice(page: BeautifulSoup) -> str | None:
+    """What a page announces in its alert area (maintenance windows, say)."""
+    return _quoted(_page_text(page, messages_only=True))
+
+
+def _switched_off(page: BeautifulSoup, names: tuple[str, ...]) -> bool:
+    """True when the page renders any of the named controls disabled."""
+    return any(
+        control.has_attr("disabled")
+        for control in page.find_all(["input", "button"])
+        if control.get("name") in names
+    )
+
+
+def _sign_in_rejected(
+    login_page: BeautifulSoup, answer_html: str, secrets: tuple[str, ...]
+) -> NBPowerSignInRejected:
+    """Describe a sign-in the portal answered with its login page.
+
+    The portal's reason is what the answer shows that the login page did
+    not show before the sign-in (site-wide notices are on both): in its
+    alert and validation elements if anything is new there, anywhere on
+    the page otherwise. Failing that, the notices themselves are passed on
+    as what the page had to say.
+    """
+    answer = BeautifulSoup(answer_html, "html.parser")
+    new: list[str] = []
+    for messages_only in (True, False):
+        shown_before = set(_page_text(login_page, messages_only=messages_only))
+        new = [
+            text
+            for text in _page_text(answer, messages_only=messages_only)
+            if text not in shown_before
+        ]
+        if new:
+            break
+    reason = _quoted(new, secrets)
+    if reason is None and "Cookies required" in answer_html:
+        reason = "Cookies required"
+    return NBPowerSignInRejected(
+        reason,
+        notice=_notice(login_page),
+        challenged=_shows_word_verification(answer),
+    )
 
 
 def _num(value: Any) -> float | None:
@@ -302,6 +488,34 @@ class NBPowerClient:
         self.meter_number = None
         self.user_type = "Residential"
 
+    def session_state(self) -> dict[str, Any] | None:
+        """What it takes to go on using this sign-in later; None if signed out.
+
+        The widget token works without the portal's cookies, so a client
+        given this by :meth:`resume` needs no sign-in of its own until the
+        token expires.
+        """
+        if not self.bootstrapped:
+            return None
+        return {
+            "token": self.token,
+            "account_number": self.account_number,
+            "utility_account_number": self.utility_account_number,
+            "user_type": self.user_type,
+        }
+
+    def resume(self, state: dict[str, Any]) -> None:
+        """Take up a sign-in saved by :meth:`session_state`, unverified.
+
+        The token may have expired since: the first request then raises
+        NBPowerAuthError, as it does for any expired token.
+        """
+        self.invalidate()
+        self.token = state.get("token")
+        self.account_number = state.get("account_number")
+        self.utility_account_number = state.get("utility_account_number")
+        self.user_type = str(state.get("user_type") or "Residential")
+
     # ------------------------------------------------------------------
     # Public data access
     # ------------------------------------------------------------------
@@ -312,26 +526,36 @@ class NBPowerClient:
         """Log in with portal credentials and resolve identifiers.
 
         The MyAccount login is the most fragile part of the flow (ASP.NET
-        postback, a BotDetect field that would fail as an auth error if NB
-        Power ever enforced the CAPTCHA). ``validate=False`` skips the
-        confirming usage request, for callers whose next request exercises
-        the token anyway.
+        postback, a BotDetect word verification the portal can ask for).
+        Only a sign-in the portal turns away raises NBPowerAuthError
+        (NBPowerSignInRejected when it says so with its login page); any
+        other failure is an NBPowerApiError — NBPowerSignInClosed when the
+        login form is switched off for maintenance, in which case nothing
+        is posted. ``validate=False`` skips the confirming usage request,
+        for callers whose next request exercises the token anyway.
         """
         self.invalidate()
         await self._prime_session()
         await self._login(username, password)
         token = await self._account_token()
-        # The page-scraped token type is accepted by VerifyToken, which is
-        # what resolves the account identifiers in the login flow.
-        data = await self._verify_token(token)
-        await self.bootstrap_with_token(
-            token,
-            account_number=data.get("AccountNumber"),
-            utility_account_number=data.get("UtilityAccountNumber"),
-            validate=validate,
-        )
-        # Set after bootstrap_with_token, whose invalidate() would reset it.
-        self.user_type = str(data.get("AccountType") or "Residential")
+        try:
+            # The page-scraped token type is accepted by VerifyToken, which
+            # is what resolves the account identifiers in the login flow.
+            data = await self._verify_token(token)
+            await self.bootstrap_with_token(
+                token,
+                account_number=data.get("AccountNumber"),
+                utility_account_number=data.get("UtilityAccountNumber"),
+                user_type=str(data.get("AccountType") or "") or None,
+                validate=validate,
+            )
+        except NBPowerAuthError as err:
+            # The portal signed in and issued this token itself: refusing
+            # it is the WidgetAPI's doing, no verdict on the credentials.
+            self.invalidate()
+            raise NBPowerApiError(
+                f"The WidgetAPI refused the token the portal just issued: {err}"
+            ) from err
 
     async def bootstrap_with_token(
         self,
@@ -339,6 +563,7 @@ class NBPowerClient:
         *,
         account_number: str | int | None = None,
         utility_account_number: str | int | None = None,
+        user_type: str | None = None,
         validate: bool = True,
     ) -> None:
         """Adopt a browser-captured widget token and validate it.
@@ -352,12 +577,16 @@ class NBPowerClient:
         with HTTP 400 without them, and the token does not encode them).
 
         Tokens expire after roughly a day; widget calls then raise
-        NBPowerAuthError and a fresh token must be supplied.
+        NBPowerAuthError and a fresh token must be supplied. ``user_type``
+        is the account's ``AccountType``, so the validating request already
+        carries it rather than an assumed Residential.
         """
         self.invalidate()
         self.token = token
         self.account_number = account_number
         self.utility_account_number = utility_account_number
+        if user_type:
+            self.user_type = user_type
         if not (self.account_number and self.utility_account_number):
             raise NBPowerApiError(
                 "Account number and utility account number are required "
@@ -426,7 +655,9 @@ class NBPowerClient:
         )
         result = body.get("result") if isinstance(body, dict) else None
         if not isinstance(result, dict) or "Data" not in result:
-            raise NBPowerApiError(f"Unexpected usage payload: {body}")
+            raise NBPowerApiError(
+                f"Unexpected usage payload: {_shape(result if result is not None else body)}"
+            )
         return body
 
     async def get_monthly_usage(self) -> tuple[list[UsageRow], dict[str, float | None]]:
@@ -475,6 +706,11 @@ class NBPowerClient:
 
     async def _get_html(self, path: str) -> tuple[str, str]:
         """GET a portal page; return (html, final_url)."""
+        html, final_url, _ = await self._get_page(path)
+        return html, final_url
+
+    async def _get_page(self, path: str) -> tuple[str, str, int]:
+        """GET a portal page; return (html, final_url, status)."""
         url = f"{self._base}{path}"
         headers = {
             "User-Agent": (
@@ -488,7 +724,7 @@ class NBPowerClient:
         async with self._session.get(
             url, headers=headers, timeout=_REQUEST_TIMEOUT, allow_redirects=True
         ) as resp:
-            return await resp.text(), str(resp.url)
+            return await resp.text(), str(resp.url), resp.status
 
     async def _post_form(
         self, url: str, data: dict[str, str], referer: str
@@ -528,11 +764,15 @@ class NBPowerClient:
     async def _prime_session(self) -> None:
         """Load the portal and select English to obtain a session cookie."""
         path = "/Default.aspx"
-        html, _ = await self._get_html(path)
+        html, _, status = await self._get_page(path)
         soup = BeautifulSoup(html, "html.parser")
         fields, action = self._form_fields(soup)
         if action is None:
-            raise NBPowerApiError("Portal home page has no form (site changed?)")
+            # Not always a changed site: from outside the countries it
+            # serves, the portal answers HTTP 403 "Access Unavailable".
+            raise NBPowerApiError(
+                f"Portal home page has no form ({_describe(soup, status)})"
+            )
         data = {
             "__VIEWSTATE": fields.get("__VIEWSTATE", ""),
             "__VIEWSTATEGENERATOR": fields.get("__VIEWSTATEGENERATOR", ""),
@@ -548,11 +788,13 @@ class NBPowerClient:
         """Submit credentials to the WebForms login page."""
         path = "/auth/weblogin.aspx"
         login_url = f"{self._base}{path}"
-        html, _ = await self._get_html(path)
+        html, _, page_status = await self._get_page(path)
         soup = BeautifulSoup(html, "html.parser")
         fields, action = self._form_fields(soup)
         if action is None:
-            raise NBPowerApiError("Login page has no form (site changed?)")
+            raise NBPowerApiError(
+                f"Login page has no form ({_describe(soup, page_status)})"
+            )
 
         user_field = "ctl00$contentPlaceHolder$txtUsername"
         pass_field = "ctl00$contentPlaceHolder$txtPassword"
@@ -573,14 +815,21 @@ class NBPowerClient:
             ) and (name := el.get("name")):
                 submit_field = name
 
+        # For scheduled maintenance the portal renders these controls
+        # disabled and announces the window on the page. Posted anyway, the
+        # form simply comes back — which is how a wrong password looks, and
+        # what stopped the integration until 0.13. Post nothing.
+        if _switched_off(soup, (user_field, pass_field, submit_field)):
+            raise NBPowerSignInClosed(_notice(soup))
+
         data = dict(fields)
         data[user_field] = username
         data[pass_field] = password
         data[submit_field] = fields.get(submit_field, "Login")
         # The login form carries a BotDetect hidden field normally populated
         # client-side; keeping the scraped value (or the known default when
-        # empty) has been observed to pass. If NB Power starts enforcing the
-        # CAPTCHA this will fail with an auth error.
+        # empty) has been observed to pass. When the portal does ask for
+        # the word verification, the sign-in comes back rejected below.
         captcha_field = "ctl00$contentPlaceHolder$hdnCaptchaText"
         if captcha_field in data and not data[captcha_field]:
             data[captcha_field] = "BotDetect CAPTCHA ASP.NET Form Validation"
@@ -596,7 +845,9 @@ class NBPowerClient:
             # polling until the user re-entered their password.
             raise NBPowerApiError(f"Login POST returned HTTP {status}")
         if "weblogin.aspx" in final_url.lower() or "Cookies required" in html2:
-            raise NBPowerAuthError("Invalid credentials or blocked login")
+            # Back on the login page. That is not proof of a wrong password
+            # (see NBPowerSignInRejected), so pass on what the page said.
+            raise _sign_in_rejected(soup, html2, (username, password))
 
     async def _account_token(self) -> str:
         """Scrape the SEW widget token from the first portal page with one.
@@ -617,7 +868,9 @@ class NBPowerClient:
         for path in _TOKEN_PAGES:
             html, final_url = await self._get_html(path)
             if "weblogin.aspx" in final_url.lower():
-                raise NBPowerAuthError("Session did not survive login")
+                raise NBPowerAuthError(
+                    "NB Power accepted the sign-in, then asked to sign in again"
+                )
             soup = BeautifulSoup(html, "html.parser")
             for el in soup.find_all("input", attrs={"name": _SEW_TOKEN_NAME_RE}):
                 if token := el.get("value"):
@@ -642,7 +895,12 @@ class NBPowerClient:
         result = body.get("result") if isinstance(body, dict) else None
         data = result.get("Data") if isinstance(result, dict) else None
         if not isinstance(data, dict):
-            raise NBPowerApiError(f"VerifyToken returned unexpected payload: {body}")
+            message = result.get("Message") if isinstance(result, dict) else None
+            raise NBPowerApiError(
+                f"VerifyToken returned no account data, saying {message!r}"
+                if message
+                else f"VerifyToken returned {_shape(body)}"
+            )
         return data
 
     # ------------------------------------------------------------------
@@ -708,7 +966,7 @@ class NBPowerClient:
             # expired token: "Token has been expired.").
             result = body.get("result") if isinstance(body, dict) else None
             if isinstance(result, dict) and result.get("Status") == 0:
-                message = str(result.get("Message") or body)
+                message = str(result.get("Message") or "no message given")
                 if "token" in message.lower() or "expired" in message.lower():
                     raise NBPowerAuthError(f"WidgetAPI token rejected: {message}")
                 raise NBPowerApiError(f"WidgetAPI {path} error: {message}")

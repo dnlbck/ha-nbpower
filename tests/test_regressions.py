@@ -39,7 +39,7 @@ async def _setup(hass, portal, nbpower_urls, *, backfill_hourly=True):
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await nb.recorder_done(hass)
     return entry
 
 
@@ -66,7 +66,7 @@ def _interval_sum(day, from_hour=0):
 async def _refresh(hass, coordinator):
     await coordinator.async_refresh()
     await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
+    await nb.recorder_done(hass)
 
 
 def _mi_calls(portal, since):
@@ -190,12 +190,12 @@ async def test_alignment_ignores_display_unit(
         StatisticData(start=midnight + timedelta(hours=1), state=100.0, sum=100.5),
         StatisticData(start=midnight + timedelta(hours=2), state=100.5, sum=101.0),
     ])
-    await get_instance(hass).async_block_till_done()
+    await nb.recorder_done(hass)
     er.async_get(hass).async_update_entity_options(sid, "sensor", {"unit_of_measurement": "MWh"})
     await hass.async_block_till_done()
 
     await _async_align_native_block(hass, sid, midnight, 100.0)
-    await get_instance(hass).async_block_till_done()
+    await nb.recorder_done(hass)
     sums = [r["sum"] for r in await _rows(hass, sid) if r["start"] >= midnight.timestamp()]
     assert sums == pytest.approx([100.0, 100.5, 101.0], abs=0.001)
 
@@ -245,6 +245,15 @@ async def test_backfill_option_off_imports_recent_window_only(
     assert entry.runtime_data.stored_stats_frontier() is not None
 
 
+# What www.nbpower.com answers, with HTTP 403, from a country it does not
+# serve (live, 2026-11, through a VPN exit abroad).
+GEO_BLOCK_PAGE = (
+    "<html><head><title>Access Unavailable / Accès non disponible</title></head>"
+    "<body><h1>Access Unavailable</h1><p>Sorry, this website is not available "
+    "from your current location.</p></body></html>"
+)
+
+
 @pytest.fixture
 async def faulty_portal(socket_enabled):
     """The mock portal with switchable faults (login outage, rejected usage,
@@ -254,6 +263,8 @@ async def faulty_portal(socket_enabled):
     @web.middleware
     async def faults(request, handler):
         state = app["state"]
+        if state.get("geo_blocked"):
+            return web.Response(status=403, text=GEO_BLOCK_PAGE, content_type="text/html")
         if state.get("login_503") and request.method == "POST" and "weblogin" in request.path:
             return web.Response(status=503, text="Service Unavailable")
         if (page := state.get("account_page")) and request.path.endswith("AccountSummaryView.aspx"):
@@ -264,6 +275,8 @@ async def faulty_portal(socket_enabled):
             return web.json_response(
                 {"result": {"Status": 0, "Message": "Token has been expired.", "Data": None}}
             )
+        if state.get("usage_500") and request.path.endswith("GetUsageGeneration"):
+            return web.Response(status=500, text="Internal Server Error")
         return await handler(request)
 
     app.middlewares.append(faults)
@@ -292,7 +305,9 @@ async def test_login_server_error_does_not_demand_reauth(
     assert not entry.runtime_data.last_update_success
     assert not _reauth_flows(hass)
 
-    faulty_portal.app["state"]["login_503"] = False  # maintenance over
+    # Maintenance over, and so is the pause the failed sign-in called for.
+    faulty_portal.app["state"]["login_503"] = False
+    entry.runtime_data._sign_in.retry_at = None
     await _refresh(hass, entry.runtime_data)
     assert entry.runtime_data.last_update_success
 
@@ -310,6 +325,55 @@ async def test_rejected_fresh_session_does_not_demand_reauth(
     assert not _reauth_flows(hass)
 
 
+async def test_rejected_fresh_session_is_not_signed_in_again_at_once(
+    recorder_mock, hass, faulty_portal, nbpower_urls, patched_helper_session,
+    enable_custom_integrations,
+):
+    """Home Assistant retries a failed setup within seconds, and each try
+    used to be another sign-in."""
+    nbpower_urls(nb.server_base(faulty_portal))
+    faulty_portal.app["state"]["reject_usage"] = True
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="NB Power 1234567",
+        data=FLOW_INPUT,
+        unique_id=f"account_{nb.ACCOUNT_NUMBER}",
+    )
+    entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    for _ in range(3):
+        await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+    assert entry.state is entry.state.SETUP_RETRY
+    assert len(faulty_portal.app["login_posts"]) == 1
+    assert not _reauth_flows(hass)
+
+
+async def test_usage_errors_do_not_cause_repeated_sign_ins(
+    recorder_mock, hass, faulty_portal, nbpower_urls, patched_helper_session,
+    enable_custom_integrations,
+):
+    entry = await _setup(hass, faulty_portal, nbpower_urls, backfill_hourly=False)
+    posts = faulty_portal.app["login_posts"]
+    assert len(posts) == 1
+    faulty_portal.app["state"]["usage_500"] = True
+
+    # Running: the session was working, so it is kept and simply retried.
+    await _refresh(hass, entry.runtime_data)
+    assert not entry.runtime_data.last_update_success
+    assert len(posts) == 1
+
+    # A restart does not stay with a stored session that draws an error:
+    # one new sign-in, then none at the pace the setup is retried.
+    for _ in range(3):
+        await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+    assert entry.state is entry.state.SETUP_RETRY
+    assert len(posts) == 2
+    assert not _reauth_flows(hass)
+
+
 async def test_reauth_rejects_a_different_account(
     recorder_mock, hass, portal, nbpower_urls, patched_helper_session,
     enable_custom_integrations, monkeypatch,
@@ -317,7 +381,7 @@ async def test_reauth_rejects_a_different_account(
     entry = await _setup(hass, portal, nbpower_urls, backfill_hourly=False)
 
     async def _other_account(hass, username, password):
-        return "7654321"
+        return "7654321", None
 
     monkeypatch.setattr(config_flow, "_validate_login", _other_account)
     result = await entry.start_reauth_flow(hass)
@@ -483,6 +547,20 @@ async def test_config_flow_finds_a_relocated_widget_token(
     result = await _user_flow(hass)
     await hass.async_block_till_done(wait_background_tasks=True)
     assert result["type"] == FlowResultType.CREATE_ENTRY
+
+
+async def test_config_flow_names_a_refused_location(
+    hass, faulty_portal, nbpower_urls, patched_helper_session,
+    enable_custom_integrations, caplog,
+):
+    """A page that is not the portal's is reported with its status and
+    title, not as "site changed?"."""
+    nbpower_urls(nb.server_base(faulty_portal))
+    faulty_portal.app["state"]["geo_blocked"] = True
+    result = await _user_flow(hass)
+    assert result["errors"] == {"base": "portal_error"}
+    assert "HTTP 403, title 'Access Unavailable / Accès non disponible'" in caplog.text
+    assert not faulty_portal.app["login_posts"]
 
 
 async def test_config_flow_unreachable_portal_is_cannot_connect(

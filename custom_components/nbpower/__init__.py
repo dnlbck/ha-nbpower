@@ -19,7 +19,7 @@ from .const import (
     DOMAIN,
     WIDGET_API_URL,
 )
-from .coordinator import NBPowerCoordinator
+from .coordinator import NBPowerCoordinator, async_remove_stored
 from .statistics import (
     async_backfill_hourly_statistics,
     async_import_history_statistics,
@@ -89,7 +89,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: NBPowerConfigEntry) -> b
         f"{DOMAIN}_hourly_backfill_{entry.entry_id}",
     )
 
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # No update listener: the options flow reloads the entry itself, and so
+    # do re-authentication and reconfiguration.
     return True
 
 
@@ -98,8 +99,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: NBPowerConfigEntry) -> 
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
-async def _async_update_listener(
-    hass: HomeAssistant, entry: NBPowerConfigEntry
-) -> None:
-    """Reload the entry when its options change."""
-    await hass.config_entries.async_reload(entry.entry_id)
+async def async_remove_entry(hass: HomeAssistant, entry: NBPowerConfigEntry) -> None:
+    """Delete the stored progress of an entry that was removed.
+
+    The statistics stay: they are the account's history, and an entry added
+    again for the same account rebuilds them under the same ids.
+    """
+    await async_remove_stored(hass, entry)

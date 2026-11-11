@@ -86,7 +86,11 @@ async def test_bootstrap_adopts_the_portals_account_type(portal):
         await client.bootstrap("user@example.com", "s3cret")
         assert client.user_type == "General Service"
         await client.get_daily_usage()
-        assert portal.app["usage_calls"][-1]["UserType"] == "General Service"
+        # The request that validates the sign-in carries it as well.
+        assert [call["UserType"] for call in portal.app["usage_calls"]] == [
+            "General Service",
+            "General Service",
+        ]
 
 
 async def test_interval_usage_returns_96_rows(client):

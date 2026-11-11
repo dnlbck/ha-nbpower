@@ -21,7 +21,8 @@ against live traffic.
 ## Features
 
 - Username/password sign-in with automatic session renewal (tokens expire
-  within hours; the integration just logs in again)
+  within hours; the integration just logs in again), and it waits out the
+  portal's maintenance windows instead of asking for your password again
 - **Energy dashboard ready**: hourly energy and cost statistics
   (**NB Power energy** / **NB Power cost**) that put every hour's usage in
   the hour it happened, as soon as the portal publishes it — even though
@@ -38,14 +39,16 @@ against live traffic.
 A refresh makes the monthly and daily requests plus one interval request
 and one hourly request per day still being published (usually 1–3 each);
 fully published days are settled and not fetched again. When the portal
-session has expired, the sign-in adds a handful of requests.
+session has expired, the sign-in adds a handful of requests. The session
+is kept across restarts and reloads, so those do not sign in again while
+it still works.
 
 ## Entities
 
 | Entity | Class | Description |
 |---|---|---|
 | `sensor.nb_power_energy_usage` | energy (kWh, total increasing) | Cumulative counter: the imported history, advanced by the 15-minute interval feed. Its usage lands at the poll that picks it up, not in the hour it was used — use the statistics below for the Energy dashboard. |
-| `sensor.nb_power_cost_usage` | monetary (CAD, total) | Cumulative energy cost from the portal's books |
+| `sensor.nb_power_cost_usage` | monetary (CAD, total) | Cumulative energy cost. Advances by what the **NB Power cost** statistic gains, so it also lands at the poll that picks it up. |
 | `sensor.nb_power_last_daily_energy` | energy (kWh) | Most recent daily total in the portal's window |
 | `sensor.nb_power_month_to_date_energy` | energy (kWh) | Month-to-date usage |
 | `sensor.nb_power_month_to_date_cost` | monetary (CAD) | Month-to-date cost |
@@ -92,13 +95,44 @@ your Home Assistant configuration and restart.
    statistics; the hourly-resolution upgrade then runs in the background
    (a few minutes, one paced request per day, resumable)
 
-If login fails with *invalid credentials*, sign in to www.nbpower.com once
-in a normal browser and try again (NB Power occasionally challenges logins;
-a recent browser session satisfies it). If it fails with *an unexpected
+If the sign-in is *turned away*, check the username and password; the form
+repeats whatever the portal said about it. If NB Power *is not taking
+sign-ins*, its login form is switched off for maintenance (see below) and
+there is nothing to do but try again later. If it fails with *an unexpected
 response*, the Home Assistant log names the sign-in step that failed, the
 pages the login landed on and any token error the portal itself reported
 (search the log for `nbpower`) — please include that line when opening an
 issue.
+
+### When NB Power is not taking sign-ins
+
+NB Power switches its login form off for scheduled maintenance (one window
+lasted 29 hours) and says on the login page from when until when. The
+integration sees that and keeps your credentials to itself. It looks again
+after 10, 30 and 60 minutes and then every two hours, and carries on by
+itself once the form is back. Meanwhile the sensors are unavailable, and
+the log quotes the portal's notice, as does the integration entry when
+Home Assistant starts during a window. Nothing is lost: once it is back
+in, the statistics fill in every hour that was published in the meantime.
+(Up to 0.12 this was taken for a wrong password, and the integration
+stopped until you re-authenticated.)
+
+A sign-in the portal turns away with its form open is not taken for a wrong
+password at once either:
+
+- It waits and tries again after 2, 4, 6 and 12 hours; the log says when
+  the next attempt is and what the portal said.
+- If the portal is still refusing after a day, Home Assistant asks you to
+  re-authenticate — but the integration keeps trying once a day for a week,
+  and withdraws the request if the portal lets it back in by itself.
+- **⋮ → Reconfigure** on the integration entry takes a new username or
+  password at any time. Entering the current ones also signs in right
+  away, without waiting for the next attempt.
+
+**⋮ → Download diagnostics** saves the integration's state, including its
+recent sign-ins and what the portal answered. Your credentials, the session
+token and the account and meter numbers are left out; usage totals are in
+it. It is the thing to attach to an issue about signing in.
 
 ### Adding to the Energy dashboard
 
@@ -182,6 +216,9 @@ dropped in `tests/fixtures/real/` to validate the parsers against real data
 - Usage numbers are the portal's data and lag by a few days. For real-time
   monitoring you need local hardware (e.g. an Emporia Vue, Shelly EM, or an
   RTL-SDR listening to the meter's AMR transmissions).
+- www.nbpower.com is not reachable from every country: through a VPN exit
+  abroad it answers *Access Unavailable* (HTTP 403, which is what the log
+  then reports), so Home Assistant has to reach it from an allowed one.
 - Multi-meter accounts: the first electricity meter is used.
 - This project is not affiliated with NB Power.
 

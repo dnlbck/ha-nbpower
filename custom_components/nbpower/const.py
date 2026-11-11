@@ -37,6 +37,36 @@ MI_SINCE_DAYS = 10
 
 CONF_BACKFILL_HOURLY = "backfill_hourly"
 
+# Waits after the portal turns a sign-in away (answers it with its login
+# page again). That is not proof of a wrong password, so it is waited out
+# and retried rather than reported as one at once. These four waits add up
+# to the first day...
+SIGN_IN_RETRY_DELAYS = (
+    timedelta(hours=2),
+    timedelta(hours=4),
+    timedelta(hours=6),
+    timedelta(hours=12),
+)
+# ...after which re-authentication is requested, while the sign-in is still
+# tried once a day this many more times (a week in all) before giving up.
+SIGN_IN_DAILY_RETRIES = 6
+
+# Waits after a sign-in that could not be made or led nowhere: the portal
+# has its login form switched off for maintenance (the usual case; a window
+# has lasted 29 hours), answered with a 5xx or a page without the expected
+# form, or the new session brought no data. No verdict on the credentials,
+# so the last wait repeats for as long as it takes — but still not at the
+# pace Home Assistant retries a setup.
+SIGN_IN_ERROR_DELAYS = (
+    timedelta(minutes=10),
+    timedelta(minutes=30),
+    timedelta(hours=1),
+    timedelta(hours=2),
+)
+
+# Recent sign-ins kept for the diagnostics download.
+SIGN_IN_EVENTS_KEPT = 20
+
 STORAGE_KEY = "nbpower"
 STORAGE_VERSION = 1
 

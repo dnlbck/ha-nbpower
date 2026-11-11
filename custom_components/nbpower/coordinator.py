@@ -8,9 +8,8 @@ from typing import Any
 
 import aiohttp
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
+from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntry, ConfigEntryState
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -27,17 +26,95 @@ from .const import (
     STORAGE_KEY,
     STORAGE_VERSION,
 )
-from .exceptions import NBPowerApiError, NBPowerAuthError
+from .exceptions import NBPowerApiError, NBPowerAuthError, NBPowerSignInClosed
+from .sign_in import ASK, GIVE_UP, SignInGuard
 
 _LOGGER = logging.getLogger(__name__)
 
 ATTR_DAILY_KWH = "daily_kwh"
 
+# Stored values a statistics repair (REPAIR_GEN) must not reset: the
+# counters' floors, the external statistics' own chain, the portal session
+# and what the portal has made of recent sign-ins.
+_KEPT_THROUGH_REPAIR = (
+    "last_cumulative_kwh",
+    "last_cumulative_cost",
+    "external",
+    "cost_ledger",
+    "session",
+    "sign_in",
+)
+
+
+def _store(hass: HomeAssistant, entry: ConfigEntry) -> Store[dict[str, Any]]:
+    return Store[dict[str, Any]](
+        hass, STORAGE_VERSION, f"{STORAGE_KEY}.{entry.entry_id}"
+    )
+
+
+def _clock(when: datetime) -> str:
+    """A moment as local wall-clock time, for messages."""
+    return dt_util.as_local(when).strftime("%Y-%m-%d %H:%M")
+
+
+def loaded_coordinator(entry: ConfigEntry) -> NBPowerCoordinator | None:
+    """The entry's coordinator, while the entry is set up."""
+    coordinator = getattr(entry, "runtime_data", None)
+    if entry.state is ConfigEntryState.LOADED and isinstance(
+        coordinator, NBPowerCoordinator
+    ):
+        return coordinator
+    return None
+
+
+async def async_stored_state(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, Any]:
+    """What an entry has stored, whether or not it is set up."""
+    if coordinator := loaded_coordinator(entry):
+        return coordinator.stored_state()
+    return await _store(hass, entry).async_load() or {}
+
+
+async def async_credentials_accepted(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Stop waiting out failed sign-ins: the portal just accepted credentials.
+
+    For the config flow, after a re-authentication or reconfiguration signed
+    in. The entry is reloaded next, and must not sit out a wait left by the
+    refusals that came before.
+    """
+    if coordinator := loaded_coordinator(entry):
+        await coordinator.async_sign_in_accepted()
+        return
+    store = _store(hass, entry)
+    if (raw := await store.async_load()) and raw.get("sign_in"):
+        guard = SignInGuard(raw["sign_in"])
+        guard.succeeded(dt_util.utcnow(), "credentials entered again")
+        await store.async_save({**raw, "sign_in": guard.as_dict()})
+
+
+@callback
+def async_hand_over_session(
+    hass: HomeAssistant, unique_id: str, session: dict[str, Any] | None
+) -> None:
+    """Leave a sign-in for the next setup of the entry with this unique id.
+
+    The config flow has just signed in to check the credentials; the setup
+    that follows takes that session over instead of signing in a second
+    time within seconds.
+    """
+    if session:
+        hass.data.setdefault(DOMAIN, {})[unique_id] = session
+
+
+async def async_remove_stored(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete a removed entry's stored progress."""
+    await _store(hass, entry).async_remove()
+
 
 class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Coordinate NB Power portal data and the cumulative energy counter.
+    """Coordinate NB Power portal data and the cumulative counters.
 
-    The portal's books feed the cost and month-to-date sensors:
+    The portal's books feed the month-to-date sensors, and both counters
+    to begin with:
 
     * ``Mode=M`` returns ~36 completed billing cycles with kWh totals —
       the deep history.
@@ -54,6 +131,19 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     feed, anchored at the value published when the frontier was pinned —
     because posting a billing cycle restructures the books by hundreds of
     kWh that the imported chain already counts.
+
+    The cost counter leaves the books too, for the hourly cost statistic
+    (see :meth:`async_statistics_cost`): the portal only lists the last 36
+    billing cycles, so the books' sum drops by a whole cycle each time a
+    new one posts, and the counter, never allowed to decrease, stood still
+    for weeks afterwards.
+
+    Signing in is paced by a :class:`~.sign_in.SignInGuard`. The portal
+    closes its login form for scheduled maintenance (seen live for 29
+    hours; six outages in five weeks looked the same from here), and a
+    sign-in that cannot be made must neither stop the integration until
+    the password is typed in again, as it did up to 0.12, nor be retried
+    at the pace Home Assistant retries a failed setup.
     """
 
     def __init__(
@@ -65,22 +155,28 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         password: str,
         scan_interval: timedelta | None = None,
     ) -> None:
+        self._scan_interval = max(
+            scan_interval or DEFAULT_SCAN_INTERVAL, MIN_SCAN_INTERVAL
+        )
         super().__init__(
             hass,
             _LOGGER,
             config_entry=entry,
             name=DOMAIN,
-            update_interval=max(
-                scan_interval or DEFAULT_SCAN_INTERVAL, MIN_SCAN_INTERVAL
-            ),
+            update_interval=self._scan_interval,
         )
         self.client = client
         self._username = username
         self._password = password
         self._stats_extension_running = False
-        self._store = Store[dict[str, Any]](
-            hass, STORAGE_VERSION, f"{STORAGE_KEY}.{entry.entry_id}"
-        )
+        self._store = _store(hass, entry)
+        self._sign_in = SignInGuard()
+        # True while the session in use came from storage or the config
+        # flow and has not fetched anything yet.
+        self._session_unproven = False
+        # Where the cost counter stands relative to the statistics chain:
+        # {"chain": <the chain's id>, "offset": <counter minus chain total>}.
+        self._cost_ledger: dict[str, Any] | None = None
         # Rows captured on the first refresh, consumed by the one-time
         # statistics backfill once the entities are registered.
         self.history_rows: list[UsageRow] = []
@@ -110,18 +206,27 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # on the first refresh after repair would let the sensor step
             # backwards (negative flow in the Energy dashboard).
             _LOGGER.info("Resetting statistics backfill for repair generation %s", REPAIR_GEN)
-            floor_kwh = raw.get("last_cumulative_kwh")
-            floor_cost = raw.get("last_cumulative_cost")
             # The external statistics are a separate chain with their own
             # generation; a sensor-chain repair must not rebuild them.
-            external = raw.get("external")
-            raw = {}
-            if floor_kwh is not None:
-                raw["last_cumulative_kwh"] = floor_kwh
-            if floor_cost is not None:
-                raw["last_cumulative_cost"] = floor_cost
-            if external:
-                raw["external"] = external
+            raw = {
+                key: raw[key]
+                for key in _KEPT_THROUGH_REPAIR
+                if raw.get(key) is not None
+            }
+        self._sign_in = SignInGuard(raw.get("sign_in"))
+        # Go on with the sign-in the config flow just made, or the one in
+        # use before the restart, rather than signing in again: a token that
+        # has expired meanwhile shows on the first request, as always.
+        handed_over = self.hass.data.get(DOMAIN, {}).pop(
+            self.config_entry.unique_id, None
+        )
+        if session := handed_over or raw.get("session"):
+            self.client.resume(session)
+            self._session_unproven = True
+        if handed_over and not self._sign_in.events:
+            # A new entry: its first sign-in was the config flow's.
+            self._sign_in.succeeded(dt_util.utcnow(), "signed in by the config flow")
+        self._cost_ledger = dict(raw["cost_ledger"]) if raw.get("cost_ledger") else None
         self.stats_imported = bool(raw.get("stats_imported"))
         through = raw.get("interval_through")
         self._interval_through = date.fromisoformat(through) if through else None
@@ -157,6 +262,35 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._external.get("gen") != EXTERNAL_GEN or not self._external.get(
             "through"
         )
+
+    async def async_statistics_cost(self, chain: str | None, total: float) -> None:
+        """Advance the cost counter to the statistics chain's running total.
+
+        Called after a pass that walked the hourly cost statistic through
+        today, with the chain's id and its sum over every published hour.
+        The counter moves by exactly what the chain gained since the last
+        call. A chain met for the first time (after an upgrade, or one
+        rebuilt from scratch) is taken up from the counter's present value,
+        so changing ledgers never steps the sensor.
+        """
+        ledger = self._cost_ledger
+        if ledger is None or ledger.get("chain") != chain:
+            base = self._last_cumulative_cost
+            ledger = {
+                "chain": chain,
+                "offset": round((total if base is None else base) - total, 3),
+            }
+        value = round(ledger["offset"] + total, 2)
+        if self._last_cumulative_cost is not None:
+            # Hours the portal revises downward must not run the counter back.
+            value = max(value, self._last_cumulative_cost)
+        if ledger != self._cost_ledger or value != self._last_cumulative_cost:
+            self._cost_ledger = ledger
+            self._last_cumulative_cost = value
+            await self._async_save_stored()
+        if self.data is not None and self.data.get("cumulative_cost") != value:
+            self.data = {**self.data, "cumulative_cost": value}
+            self.async_update_listeners()
 
     async def mark_stats_imported(self) -> None:
         """Persist that the day-resolution statistics import completed."""
@@ -232,77 +366,178 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._interval_state_seed = round(seed, 3)
         await self._async_save_stored()
 
+    def stored_state(self) -> dict[str, Any]:
+        """Everything the entry persists (also shown in the diagnostics)."""
+        return {
+            "stats_gen": REPAIR_GEN,
+            "stats_imported": self.stats_imported,
+            "interval_through": (
+                self._interval_through.isoformat() if self._interval_through else None
+            ),
+            "interval_state_seed": self._interval_state_seed,
+            "stats_frontier": (
+                self._stats_frontier.isoformat() if self._stats_frontier else None
+            ),
+            "frontier_end": self._frontier_end,
+            "sensor_anchor_at": (
+                self._sensor_anchor_at.isoformat() if self._sensor_anchor_at else None
+            ),
+            "sensor_anchor_kwh": self._sensor_anchor_kwh,
+            "cost_chain_end": self._cost_chain_end,
+            "last_cumulative_kwh": self._last_cumulative_kwh,
+            "last_cumulative_cost": self._last_cumulative_cost,
+            "cost_ledger": self._cost_ledger,
+            "external": self._external,
+            "session": self.client.session_state(),
+            "sign_in": self._sign_in.as_dict(),
+        }
+
     async def _async_save_stored(self) -> None:
-        await self._store.async_save(
-            {
-                "stats_gen": REPAIR_GEN,
-                "stats_imported": self.stats_imported,
-                "interval_through": (
-                    self._interval_through.isoformat()
-                    if self._interval_through
-                    else None
-                ),
-                "interval_state_seed": self._interval_state_seed,
-                "stats_frontier": (
-                    self._stats_frontier.isoformat()
-                    if self._stats_frontier
-                    else None
-                ),
-                "frontier_end": self._frontier_end,
-                "sensor_anchor_at": (
-                    self._sensor_anchor_at.isoformat()
-                    if self._sensor_anchor_at
-                    else None
-                ),
-                "sensor_anchor_kwh": self._sensor_anchor_kwh,
-                "cost_chain_end": self._cost_chain_end,
-                "last_cumulative_kwh": self._last_cumulative_kwh,
-                "last_cumulative_cost": self._last_cumulative_cost,
-                "external": self._external,
-            }
-        )
+        await self._store.async_save(self.stored_state())
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch usage data, logging in again if the widget token expired.
+        """Fetch usage data, signing in first when no session will do.
 
-        Portal sessions are short-lived, so an expired token mid-refresh is
-        routine: re-login transparently and retry once. Only a failed login
-        (bad credentials) surfaces as ConfigEntryAuthFailed.
+        Portal sessions are short-lived, so a token that has expired since
+        the last refresh is routine: sign in again and fetch.
         """
-        # The fetch exercises the token straight away, so the login skips
-        # its own confirming usage request.
+        # A sign-in that has to wait shortens this; anything else, the fetch
+        # succeeding included, polls at the configured pace again.
+        self.update_interval = self._scan_interval
         try:
-            if not self.client.bootstrapped:
-                await self.client.bootstrap(
-                    self._username, self._password, validate=False
-                )
-            try:
-                data = await self._async_fetch_all()
-            except NBPowerAuthError:
-                _LOGGER.debug("Widget token expired; logging in again")
-                self.client.invalidate()
-                await self.client.bootstrap(
-                    self._username, self._password, validate=False
-                )
+            data: dict[str, Any] | None = None
+            if self.client.bootstrapped:
                 try:
                     data = await self._async_fetch_all()
-                except NBPowerAuthError as err:
-                    # The login just succeeded, so the credentials are fine:
-                    # retry next interval instead of demanding re-auth.
-                    raise UpdateFailed(
-                        f"NB Power rejected a fresh session: {err}"
-                    ) from err
-        except NBPowerAuthError as err:
-            raise ConfigEntryAuthFailed(
-                f"Could not sign in to NB Power: {err}"
-            ) from err
+                except NBPowerAuthError:
+                    _LOGGER.debug("Widget token expired; signing in again")
+                except NBPowerApiError:
+                    # A session that was working is not to blame for this.
+                    # One taken over at setup has yet to work at all, and a
+                    # restart should not be stuck with it.
+                    if not self._session_unproven:
+                        raise
+                if data is None:
+                    # Out of storage too: a restart must not try it again.
+                    self.client.invalidate()
+                    await self._async_save_stored()
+            if data is None:
+                await self._async_sign_in()
+                data = await self._async_fetch_fresh()
         except NBPowerApiError as err:
             raise UpdateFailed(f"NB Power API error: {err}") from err
         except (TimeoutError, aiohttp.ClientError) as err:
             raise UpdateFailed(f"Error communicating with NB Power: {err}") from err
 
+        self._session_unproven = False
         self._async_schedule_stat_extension()
         return data
+
+    async def _async_fetch_fresh(self) -> dict[str, Any]:
+        """Fetch with the session a sign-in has just returned.
+
+        If the portal has no data for it, there is still no second sign-in
+        right away: not in this refresh, and not by a setup that is retried
+        seconds from now. The next one waits as after a failed sign-in.
+        """
+        try:
+            return await self._async_fetch_all()
+        except (NBPowerAuthError, NBPowerApiError) as err:
+            now = dt_util.utcnow()
+            if rejected := isinstance(err, NBPowerAuthError):
+                # The credentials are fine (the sign-in just succeeded), so
+                # no re-auth; the token is no use, though.
+                self.client.invalidate()
+            self._sign_in.failed(now, f"No data after signing in: {err}")
+            await self._async_save_stored()
+            self._poll_at(self._sign_in.retry_at or now, now)
+            raise UpdateFailed(
+                f"NB Power rejected a fresh session: {err}"
+                if rejected
+                else f"NB Power API error: {err}"
+            ) from err
+
+    async def _async_sign_in(self) -> None:
+        """Sign in to the portal, pacing the attempts after a failed one.
+
+        The fetch exercises the token straight away, so the sign-in skips
+        its own confirming usage request. A sign-in that cannot be made
+        (the login form is off for maintenance) or that the portal turns
+        away is waited out and retried (see sign_in.py): UpdateFailed while
+        that goes on, ConfigEntryAuthFailed only once the portal has turned
+        the credentials away for a week.
+        """
+        now = dt_util.utcnow()
+        if (until := self._sign_in.wait_until(now)) is not None:
+            self._poll_at(until, now)
+            raise UpdateFailed(
+                f"Waiting until {_clock(until)} to sign in to NB Power again"
+                f" ({self._sign_in.last_failure or 'the last sign-in failed'})"
+            )
+        try:
+            await self.client.bootstrap(self._username, self._password, validate=False)
+        except NBPowerAuthError as err:
+            verdict = self._sign_in.rejected(now, str(err))
+            await self._async_save_stored()
+            attempts = self._sign_in.rejections
+            since = _clock(self._sign_in.rejected_since or now)
+            if verdict == GIVE_UP:
+                raise ConfigEntryAuthFailed(
+                    f"{err} ({attempts} sign-ins turned away since {since})"
+                ) from err
+            until = self._sign_in.retry_at or now
+            self._poll_at(until, now)
+            if verdict == ASK:
+                # A day of refusals: time to ask whether the password
+                # changed. The portal may still come round by itself, so
+                # keep trying (the request is withdrawn if it does).
+                self.config_entry.async_start_reauth(self.hass)
+            _LOGGER.warning(
+                "%s. Sign-in %s turned away since %s; next attempt at %s%s",
+                err,
+                attempts,
+                since,
+                _clock(until),
+                " (re-authentication requested meanwhile)" if verdict == ASK else "",
+            )
+            raise UpdateFailed(f"{err}; next attempt at {_clock(until)}") from err
+        except NBPowerApiError as err:
+            # The login form switched off for maintenance (the usual case),
+            # a 5xx, a page that is not the portal's: no verdict on the
+            # credentials, and worth looking again sooner than a refusal.
+            self._sign_in.failed(now, str(err))
+            await self._async_save_stored()
+            self._poll_at(self._sign_in.retry_at or now, now)
+            raise UpdateFailed(
+                str(err)
+                if isinstance(err, NBPowerSignInClosed)
+                else f"NB Power sign-in failed: {err}"
+            ) from err
+        self._session_unproven = False
+        lasted = self._sign_in.succeeded(now)
+        await self._async_save_stored()
+        if lasted is not None:
+            _LOGGER.info(
+                "NB Power accepts the sign-in again, after turning it away for %s",
+                str(lasted).split(".")[0],
+            )
+            self._async_withdraw_reauth()
+
+    def _poll_at(self, when: datetime, now: datetime) -> None:
+        """Refresh when a sign-in wait ends, if that is before the next poll."""
+        wait = max(when - now, timedelta(seconds=30)) + timedelta(seconds=5)
+        self.update_interval = min(self._scan_interval, wait)
+
+    def _async_withdraw_reauth(self) -> None:
+        """Drop a pending request for credentials that turned out to work."""
+        entry = self.config_entry
+        for flow in list(entry.async_get_active_flows(self.hass, {SOURCE_REAUTH})):
+            self.hass.config_entries.flow.async_abort(flow["flow_id"])
+
+    async def async_sign_in_accepted(self) -> None:
+        """Credentials the user entered again were accepted (config flow)."""
+        self._sign_in.succeeded(dt_util.utcnow(), "credentials entered again")
+        await self._async_save_stored()
 
     def _async_schedule_stat_extension(self) -> None:
         """Import hourly statistics for newly published days after a refresh.
@@ -459,6 +694,10 @@ class NBPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         books_cost = round(
             sum(row.amount or 0.0 for row in monthly) + _post_cycle(lambda r: r.amount), 2
         )
+        if self._cost_ledger is not None and self._last_cumulative_cost is not None:
+            # The cost counter rides the statistics chain: the pass that
+            # follows this refresh advances it (async_statistics_cost).
+            books_cost = self._last_cumulative_cost
 
         # Estimated days can be revised between refreshes; the Energy
         # dashboard treats a decreasing total_increasing sensor as a meter
