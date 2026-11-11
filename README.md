@@ -31,24 +31,23 @@ against live traffic.
   resolution — each cycle's kWh spread evenly across its days — then the
   last ~12 months at hourly resolution, fetched by a resumable background
   task (one request per day, paced)
-- A cumulative `total_increasing` kWh sensor advanced by the portal's
-  interval feed, plus a cumulative CAD cost sensor
+- Cumulative kWh (`total_increasing`) and CAD cost sensors that follow
+  those statistics
 - Month-to-date usage and cost, projected usage and bill
 - CAD monetary sensors, daily usage attributes
 
-A refresh makes the monthly and daily requests plus one interval request
-and one hourly request per day still being published (usually 1–3 each);
-fully published days are settled and not fetched again. When the portal
-session has expired, the sign-in adds a handful of requests. The session
-is kept across restarts and reloads, so those do not sign in again while
-it still works.
+A refresh makes the monthly and daily requests plus one hourly request per
+day still being published (usually 1–3); fully published days are settled
+and not fetched again. When the portal session has expired, the sign-in
+adds a handful of requests. The session is kept across restarts and
+reloads, so those do not sign in again while it still works.
 
 ## Entities
 
 | Entity | Class | Description |
 |---|---|---|
-| `sensor.nb_power_energy_usage` | energy (kWh, total increasing) | Cumulative counter: the imported history, advanced by the 15-minute interval feed. Its usage lands at the poll that picks it up, not in the hour it was used — use the statistics below for the Energy dashboard. |
-| `sensor.nb_power_cost_usage` | monetary (CAD, total) | Cumulative energy cost. Advances by what the **NB Power cost** statistic gains, so it also lands at the poll that picks it up. |
+| `sensor.nb_power_energy_usage` | energy (kWh, total increasing) | Cumulative counter. Advances by what the **NB Power energy** statistic gains, so usage lands at the poll that picks it up, not in the hour it was used — use the statistics below for the Energy dashboard. |
+| `sensor.nb_power_cost_usage` | monetary (CAD, total) | Cumulative energy cost. Advances by what the **NB Power cost** statistic gains, in the same way. |
 | `sensor.nb_power_last_daily_energy` | energy (kWh) | Most recent daily total in the portal's window |
 | `sensor.nb_power_month_to_date_energy` | energy (kWh) | Month-to-date usage |
 | `sensor.nb_power_month_to_date_cost` | monetary (CAD) | Month-to-date cost |
@@ -147,23 +146,30 @@ it from *NB Power Energy usage* (the sensor) to the statistic above, and
 the cost from *NB Power Cost usage* to *NB Power cost*. The
 statistics carry their own full history, so nothing is lost by switching.
 
+Up to 0.13 history was also backfilled into the two sensors' own
+statistics. From 0.14 on nothing is written there any more: what earlier
+versions put there stays as it is, and from then on those statistics are
+simply what the recorder makes of the sensors, like any other sensor's.
+
 Older periods (more than a year back) are each billing cycle's total
 spread evenly across its days — daily views for those months are
 estimates, while month and year views total exactly.
 
 ### Data resolution & freshness
 
-- Hourly data (`Mode: "H"`) and 15-minute data (`Mode: "MI"` — uppercase!)
-  are available for roughly the **last 12 months**, one day per request.
-  The statistics use the hourly feed; the energy sensor the 15-minute one.
-- The interval feeds publish a day's data a day or more after it ends,
-  sometimes in blocks out of order (e.g. 00–07 and 16–23 before 08–15), so
-  the Energy dashboard's "today" fills in the next day. Asking the portal
-  for a day it has not published returns another day's data instead; the
-  integration discards it.
+- Hourly data (`Mode: "H"`) is available for roughly the **last 12
+  months**, one day per request. The statistics, and with them the two
+  cumulative sensors, are built from it. (The portal has 15-minute data as
+  well, `Mode: "MI"` — uppercase! — which the integration used up to 0.13.)
+- A day's data is published a day or more after it ends, sometimes in
+  blocks out of order (e.g. 00–07 and 16–23 before 08–15), so the Energy
+  dashboard's "today" fills in the next day. Asking the portal for a day it
+  has not published returns another day's data instead; the integration
+  discards it.
 - The daily books lag about **4 days** (the last days arrive marked
-  *Estimated* and can be revised) and feed the month-to-date, projected
-  and cost sensors.
+  *Estimated* and can be revised). They feed the last-daily sensor and the
+  `daily_kwh` attribute; month-to-date and projected figures are the
+  portal's own.
 
 ### Options
 

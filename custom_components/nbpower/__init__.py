@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -16,20 +15,13 @@ from .const import (
     BASE_URL,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
-    DOMAIN,
     WIDGET_API_URL,
 )
 from .coordinator import NBPowerCoordinator, async_remove_stored
-from .statistics import (
-    async_backfill_hourly_statistics,
-    async_import_history_statistics,
-)
 
 PLATFORMS: list[str] = ["sensor"]
 
 type NBPowerConfigEntry = ConfigEntry[NBPowerCoordinator]
-
-_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: NBPowerConfigEntry) -> bool:
@@ -62,32 +54,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: NBPowerConfigEntry) -> b
         ),
     )
     await coordinator.async_load_stored()
+    # Every refresh, this first one included, is followed by a background
+    # pass that brings the statistics up to date (a few minutes the first
+    # time, with a year of hourly data to fetch).
     await coordinator.async_config_entry_first_refresh()
 
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Phase 1 (immediate): import the fetched history at day resolution. A
-    # missing recorder (rare) must not break setup; the import retries on
-    # restart.
-    try:
-        await async_import_history_statistics(hass, entry, coordinator)
-    except Exception:  # noqa: BLE001
-        _LOGGER.warning("Statistics backfill failed; will retry on restart", exc_info=True)
-
-    # Phase 2 (background): upgrade recent history to hourly resolution from
-    # 15-minute data, one paced request per day; resumable across restarts.
-    # It always runs — the chain must reach the frontier the energy sensor
-    # anchors to — and the backfill option only sets how far back it goes.
-    # Starting it now, in the same boot as phase 1, seeds its chain from the
-    # history phase 1 just imported. The first refresh's pass may still be
-    # running (on a new entry it ran before the sensor existed, so it could
-    # only start the external statistics): wait for it rather than skip.
-    entry.async_create_background_task(
-        hass,
-        async_backfill_hourly_statistics(hass, entry, coordinator, wait=True),
-        f"{DOMAIN}_hourly_backfill_{entry.entry_id}",
-    )
 
     # No update listener: the options flow reloads the entry itself, and so
     # do re-authentication and reconfiguration.

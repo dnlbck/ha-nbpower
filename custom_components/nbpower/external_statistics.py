@@ -1,23 +1,26 @@
-"""Hourly usage and cost as external statistics for the Energy dashboard.
+"""Hourly usage and cost as statistics for the Energy dashboard.
 
-The portal publishes usage a day or more after it happens. The energy
-sensor's own statistics belong to the recorder from the statistics
-frontier on, so there late usage can only appear as a step at the poll
-that picks it up, never in the hour it was used. These two external
-statistics, ``nbpower:energy_<tag>`` and ``nbpower:cost_<tag>``,
-are written by the integration alone, so every hour carries its own usage
-once the portal publishes it:
+The portal publishes usage a day or more after it happens. Statistics the
+recorder compiles from a sensor can only show such usage as a step at the
+poll that picks it up, never in the hour it was used. So the integration
+writes two (external) statistics of its own, ``nbpower:energy_<tag>`` and
+``nbpower:cost_<tag>``, in which every hour carries its own usage once the
+portal publishes it:
 
 * before the hourly window, day resolution from the books (billing cycles
   spread across their days, then the daily window), written once;
-* the hourly window (a year, or ``INTERVAL_RECENT_DAYS`` with the backfill
-  option off) from ``Mode=H``, one paced request per day, resumable;
+* the hourly window (a year, or ``HOURLY_DAYS_WITHOUT_BACKFILL`` with the
+  backfill option off) from ``Mode=H``, one paced request per day,
+  resumable;
 * on every refresh, each day after the last complete one is fetched and
   rewritten, so blocks published out of order land in their own hours and
   the later rows' sums follow.
 
-The cumulative cost sensor follows the cost chain's total (the books it
-used to sum only cover the last 36 billing cycles).
+They are the only statistics the integration writes, and its one ledger:
+the two cumulative sensors follow the chains' totals. (Up to 0.13 the
+energy sensor's own statistics were backfilled as well, from the 15-minute
+feed, and the recorder's rows patched up to fit; the sensor ran on that
+feed too.)
 """
 
 from __future__ import annotations
@@ -51,16 +54,21 @@ from .const import (
     CURRENCY,
     DOMAIN,
     EXTERNAL_GEN,
-    INTERVAL_BACKFILL_DAYS,
-    INTERVAL_RECENT_DAYS,
-    INTERVAL_REQUEST_PAUSE,
-    MI_SINCE_DAYS,
+    FINAL_AFTER_DAYS,
+    HOURLY_DAYS,
+    HOURLY_DAYS_WITHOUT_BACKFILL,
+    REQUEST_PAUSE,
 )
 from .coordinator import NBPowerCoordinator
 from .exceptions import NBPowerError
-from .statistics import daily_points
 
 _LOGGER = logging.getLogger(__name__)
+
+# One update per entry at a time: each continues the chain from the stored
+# sums, and two interleaved would write rows from the same base. Keyed by
+# entry, so accounts do not hold each other up, while a reloaded entry
+# still waits for the run its unload is cancelling.
+_locks: dict[str, asyncio.Lock] = {}
 
 
 def statistic_ids(
@@ -94,6 +102,34 @@ def _metadata(
         unit_class=unit_class,
         unit_of_measurement=unit,
     )
+
+
+def daily_points(
+    rows: list[UsageRow],
+    before: date,
+    value: Callable[[UsageRow], float | None] = lambda row: row.kwh,
+) -> list[tuple[date, float]]:
+    """Expand the books' rows into (day, value) points for days before ``before``.
+
+    Billing-cycle rows are spread evenly across their FromDate..ToDate
+    span; daily rows pass through as single points.
+    """
+    points: list[tuple[date, float]] = []
+    for row in rows:
+        row_value = value(row)
+        if row_value is None:
+            continue
+        start = row.start.date()
+        if row.end is not None:
+            end = row.end.date()
+            days = (end - start).days + 1
+            if days <= 0:
+                continue
+            per_day = round(row_value / days, 4)
+            points.extend((start + timedelta(days=i), per_day) for i in range(days))
+        else:
+            points.append((start, row_value))
+    return [point for point in points if point[0] < before]
 
 
 def hour_buckets(rows: list[UsageRow]) -> list[tuple[datetime, float, float]]:
@@ -133,14 +169,29 @@ def _chain(
     return statistics, total
 
 
-async def async_update_external_statistics(
+async def async_update_statistics(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: NBPowerCoordinator
 ) -> None:
-    """Start the chain once, then extend it through the newest published hour.
+    """Bring the statistics up to date with what the portal has published.
 
-    Runs under the entry's statistics lock (see statistics.py), after a
-    refresh has fetched the books.
+    Runs as a background task after a refresh has fetched the books, so
+    failures are logged here; the next refresh's run resumes from the
+    stored progress.
     """
+    async with _locks.setdefault(entry.entry_id, asyncio.Lock()):
+        try:
+            await _async_update(hass, entry, coordinator)
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Statistics update failed; it will retry on the next refresh",
+                exc_info=True,
+            )
+
+
+async def _async_update(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: NBPowerCoordinator
+) -> None:
+    """Start the chain once, then extend it through the newest published hour."""
     if "recorder" not in hass.config.components:
         return
     if not (ids := statistic_ids(entry, coordinator)):
@@ -190,7 +241,7 @@ async def async_update_external_statistics(
         # enough that whatever is still missing is a permanent gap.
         final = (
             len({row.start.hour for row in rows if row.kwh is not None}) >= 24
-            or (today - day).days > MI_SINCE_DAYS
+            or (today - day).days > FINAL_AFTER_DAYS
         )
         if contiguous and final:
             state.update(
@@ -204,7 +255,7 @@ async def async_update_external_statistics(
             contiguous = False
         day += timedelta(days=1)
         if day <= today:
-            await asyncio.sleep(INTERVAL_REQUEST_PAUSE)
+            await asyncio.sleep(REQUEST_PAUSE)
 
     if written:
         _LOGGER.debug(
@@ -214,9 +265,11 @@ async def async_update_external_statistics(
             state["through"],
         )
     if reached_today:
-        # The whole chain was walked, so its total counts every published
-        # hour: the cumulative cost sensor follows it.
-        await coordinator.async_statistics_cost(state.get("chain"), cost_total)
+        # The whole chain was walked, so its totals count every published
+        # hour: the cumulative sensors follow them.
+        await coordinator.async_statistics_totals(
+            state.get("chain"), energy_total, cost_total
+        )
 
 
 async def _async_start_chain(
@@ -229,9 +282,9 @@ async def _async_start_chain(
 ) -> dict[str, Any]:
     """Clear both statistics and write the history before the hourly window."""
     window = (
-        INTERVAL_BACKFILL_DAYS
+        HOURLY_DAYS
         if entry.options.get(CONF_BACKFILL_HOURLY, True)
-        else INTERVAL_RECENT_DAYS
+        else HOURLY_DAYS_WITHOUT_BACKFILL
     )
     window_start = today - timedelta(days=window)
     # A fresh chain: rows left by an earlier generation, or by a removed
@@ -257,8 +310,9 @@ async def _async_start_chain(
         async_add_external_statistics(hass, cost_meta, cost_rows)
     state = {
         "gen": EXTERNAL_GEN,
-        # Names this chain: one started later has other sums, and the cost
-        # sensor has to take it up afresh (coordinator.async_statistics_cost).
+        # Names this chain: one started later has other sums, and the
+        # sensors have to take it up afresh
+        # (coordinator.async_statistics_totals).
         "chain": dt_util.utcnow().isoformat(),
         "window_start": window_start.isoformat(),
         "through": (window_start - timedelta(days=1)).isoformat(),

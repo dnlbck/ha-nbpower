@@ -544,19 +544,17 @@ def nbpower_urls(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def fast_backfill(monkeypatch):
-    """Keep the hourly backfill tiny and instant in all tests.
+    """Keep the hourly part of the statistics tiny and instant in all tests.
 
-    With the backfill option off, no hourly days are imported at all
-    unless a test raises INTERVAL_RECENT_DAYS: those tests exercise the
-    books-based sensor and the day-resolution import on their own.
+    With the backfill option off there are no hourly days at all, unless a
+    test raises HOURLY_DAYS_WITHOUT_BACKFILL: the statistics are then the
+    books at day resolution, and the portal is asked for today only.
     """
     from custom_components.nbpower import external_statistics as nb_ext
-    from custom_components.nbpower import statistics as nb_stats
 
-    for module in (nb_stats, nb_ext):
-        monkeypatch.setattr(module, "INTERVAL_BACKFILL_DAYS", 3)
-        monkeypatch.setattr(module, "INTERVAL_RECENT_DAYS", 0)
-        monkeypatch.setattr(module, "INTERVAL_REQUEST_PAUSE", 0)
+    monkeypatch.setattr(nb_ext, "HOURLY_DAYS", 3)
+    monkeypatch.setattr(nb_ext, "HOURLY_DAYS_WITHOUT_BACKFILL", 0)
+    monkeypatch.setattr(nb_ext, "REQUEST_PAUSE", 0)
 
 
 @pytest.fixture

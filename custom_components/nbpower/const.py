@@ -18,22 +18,21 @@ CONF_SCAN_INTERVAL = "scan_interval"
 DEFAULT_SCAN_INTERVAL = timedelta(hours=4)
 MIN_SCAN_INTERVAL = timedelta(minutes=30)
 
-# Hourly-resolution backfill: 15-minute data is published ~1 year back,
-# one day per API request. The pause between requests keeps the backfill
-# polite; a full year takes a few minutes in the background.
-INTERVAL_BACKFILL_DAYS = 365
-INTERVAL_REQUEST_PAUSE = 0.25
+# The hourly part of the statistics: the portal serves hourly data about a
+# year back, one day per request. The pause between requests keeps the
+# first run polite; a full year takes a few minutes in the background.
+HOURLY_DAYS = 365
+REQUEST_PAUSE = 0.25
 
-# Hourly window when the year-long backfill is turned off. The chain still
-# has to reach the statistics frontier, so these recent days (wider than
-# the daily books' publication lag) are always imported at hourly
-# resolution; only older history stays at day resolution.
-INTERVAL_RECENT_DAYS = 10
+# The hourly part with the year-long backfill turned off. Wider than the
+# portal's publication lag, so the days still being published are at hourly
+# resolution either way; only older history stays at day resolution.
+HOURLY_DAYS_WITHOUT_BACKFILL = 10
 
-# Age (days) at which the 15-minute feed is treated as final: data still
-# missing by then is a permanent gap (meter outage), so partial or empty
-# days that old are settled or imported as published instead of awaited.
-MI_SINCE_DAYS = 10
+# Age (days) at which a day is taken as final: hours still missing by then
+# are a permanent gap (meter outage), so the day stays as published instead
+# of being fetched again on every refresh.
+FINAL_AFTER_DAYS = 10
 
 CONF_BACKFILL_HOURLY = "backfill_hourly"
 
@@ -70,10 +69,6 @@ SIGN_IN_EVENTS_KEPT = 20
 STORAGE_KEY = "nbpower"
 STORAGE_VERSION = 1
 
-# Bump to force one clean re-import of all statistics (day rows + hourly
-# upgrade) after changes to the state-chaining convention.
-REPAIR_GEN = 9
-
-# Bump to clear and rebuild the hourly external statistics (the Energy
-# dashboard's series) from scratch. Independent of REPAIR_GEN.
+# Bump to clear and rebuild the statistics (the Energy dashboard's series)
+# from scratch.
 EXTERNAL_GEN = 1

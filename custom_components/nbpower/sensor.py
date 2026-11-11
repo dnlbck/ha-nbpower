@@ -151,7 +151,6 @@ class NBPowerSensorEntity(CoordinatorEntity[NBPowerCoordinator], SensorEntity):
                 if data.get("last_daily_date")
                 else None
             ),
-            "today_kwh": data.get("today_kwh", 0.0),
             "daily_kwh": data.get("daily_kwh"),
         }
         return attrs
